@@ -1,4 +1,3 @@
-{-# LANGUAGE CPP #-}
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.PackageDescription.PrettyPrint
@@ -18,27 +17,18 @@ module Distribution.PackageDescription.PrettyPrint (
     showGenericPackageDescription,
 ) where
 
-#if __GLASGOW_HASKELL__ < 710
-import Data.Monoid (Monoid(mempty))
-#endif
 import Distribution.PackageDescription
-       ( Benchmark(..), BenchmarkInterface(..), benchmarkType
-       , TestSuite(..), TestSuiteInterface(..), testType
-       , SourceRepo(..),
-        customFieldsBI, CondTree(..), Condition(..), cNot,
-        FlagName(..), ConfVar(..), Executable(..), Library(..),
-        Flag(..), PackageDescription(..),
-        GenericPackageDescription(..))
+import Distribution.Simple.Utils
+import Distribution.ParseUtils
+import Distribution.PackageDescription.Parse
+import Distribution.Package
+import Distribution.Text
+
+import Data.Monoid as Mon (Monoid(mempty))
+import Data.Maybe (isJust)
 import Text.PrettyPrint
        (hsep, parens, char, nest, empty, isEmpty, ($$), (<+>),
         colon, (<>), text, vcat, ($+$), Doc, render)
-import Distribution.Simple.Utils (writeUTF8File)
-import Distribution.ParseUtils (showFreeText, FieldDescr(..), indentWith, ppField, ppFields)
-import Distribution.PackageDescription.Parse (pkgDescrFieldDescrs,binfoFieldDescrs,libFieldDescrs,
-       sourceRepoFieldDescrs,flagFieldDescrs)
-import Distribution.Package (Dependency(..))
-import Distribution.Text (Text(..))
-import Data.Maybe (isJust)
 
 -- | Recompile with false for regression testing
 simplifiedPrinting :: Bool
@@ -56,7 +46,8 @@ ppGenericPackageDescription :: GenericPackageDescription -> Doc
 ppGenericPackageDescription gpd          =
         ppPackageDescription (packageDescription gpd)
         $+$ ppGenPackageFlags (genPackageFlags gpd)
-        $+$ ppLibrary (condLibrary gpd)
+        $+$ ppLibraries (unPackageName (packageName (packageDescription gpd)))
+                        (condLibraries gpd)
         $+$ ppExecutables (condExecutables gpd)
         $+$ ppTestSuites (condTestSuites gpd)
         $+$ ppBenchmarks (condBenchmarks gpd)
@@ -116,10 +107,10 @@ ppFlag flag@(MkFlag name _ _ _)    =
   where
     fields = ppFieldsFiltered flagDefaults flagFieldDescrs flag
 
-ppLibrary :: (Maybe (CondTree ConfVar [Dependency] Library)) -> Doc
-ppLibrary Nothing                        = empty
-ppLibrary (Just condTree)                =
-    emptyLine $ text "library" $+$ nest indentWith (ppCondTree condTree Nothing ppLib)
+ppLibraries :: String -> [(String, CondTree ConfVar [Dependency] Library)] -> Doc
+ppLibraries pn libs                           =
+    vcat [emptyLine $ text (if n == pn then "library" else "library " ++ n)
+              $+$ nest indentWith (ppCondTree condTree Nothing ppLib)| (n,condTree) <- libs]
   where
     ppLib lib Nothing     = ppFieldsFiltered libDefaults libFieldDescrs lib
                             $$  ppCustomFields (customFieldsBI (libBuildInfo lib))
@@ -236,9 +227,9 @@ ppIf' :: a -> (a -> Maybe a -> Doc)
            -> Condition ConfVar
            -> CondTree ConfVar [Dependency] a
            -> Doc
-ppIf' it ppIt c thenTree = 
+ppIf' it ppIt c thenTree =
   if isEmpty thenDoc
-     then mempty
+     then Mon.mempty
      else ppIfCondition c $$ nest indentWith thenDoc
   where thenDoc = ppCondTree thenTree (if simplifiedPrinting then (Just it) else Nothing) ppIt
 
@@ -249,7 +240,7 @@ ppIfElse :: a -> (a -> Maybe a -> Doc)
               -> Doc
 ppIfElse it ppIt c thenTree elseTree =
   case (isEmpty thenDoc, isEmpty elseDoc) of
-    (True,  True)  -> mempty
+    (True,  True)  -> Mon.mempty
     (False, True)  -> ppIfCondition c $$ nest indentWith thenDoc
     (True,  False) -> ppIfCondition (cNot c) $$ nest indentWith elseDoc
     (False, False) -> (ppIfCondition c $$ nest indentWith thenDoc)

@@ -46,27 +46,16 @@ module Distribution.Simple.Program.Builtin (
   ) where
 
 import Distribution.Simple.Program.Find
-         ( findProgramOnSearchPath )
 import Distribution.Simple.Program.Internal
-         ( stripExtractVersion )
 import Distribution.Simple.Program.Run
-         ( getProgramInvocationOutput, programInvocation )
 import Distribution.Simple.Program.Types
-         ( Program(..), ConfiguredProgram(..), simpleProgram )
 import Distribution.Simple.Utils
-         ( findProgramVersion )
 import Distribution.Compat.Exception
-         ( catchIO )
 import Distribution.Verbosity
-         ( lessVerbose )
 import Distribution.Version
-         ( Version(..), withinRange, earlierVersion, laterVersion
-         , intersectVersionRanges )
+
 import Data.Char
          ( isDigit )
-
-import Data.List
-         ( isInfixOf )
 import qualified Data.Map as Map
 
 -- ------------------------------------------------------------
@@ -227,16 +216,16 @@ haskellSuiteProgram :: Program
 haskellSuiteProgram = (simpleProgram "haskell-suite") {
     -- pretend that the program exists, otherwise it won't be in the
     -- "configured" state
-    programFindLocation =
-      \_verbosity _searchPath -> return $ Just "haskell-suite-dummy-location"
+    programFindLocation = \_verbosity _searchPath ->
+      return $ Just ("haskell-suite-dummy-location", [])
   }
 
 -- This represent a haskell-suite package manager. See the comments for
 -- haskellSuiteProgram.
 haskellSuitePkgProgram :: Program
 haskellSuitePkgProgram = (simpleProgram "haskell-suite-pkg") {
-    programFindLocation =
-      \_verbosity _searchPath -> return $ Just "haskell-suite-pkg-dummy-location"
+    programFindLocation = \_verbosity _searchPath ->
+      return $ Just ("haskell-suite-pkg-dummy-location", [])
   }
 
 

@@ -29,16 +29,11 @@ module Distribution.Simple.UserHooks (
   ) where
 
 import Distribution.PackageDescription
-         (PackageDescription, GenericPackageDescription,
-          HookedBuildInfo, emptyHookedBuildInfo)
-import Distribution.Simple.Program    (Program)
-import Distribution.Simple.Command    (noExtraFlags)
-import Distribution.Simple.PreProcess (PPSuffixHandler)
+import Distribution.Simple.Program
+import Distribution.Simple.Command
+import Distribution.Simple.PreProcess
 import Distribution.Simple.Setup
-         (ConfigFlags, BuildFlags, ReplFlags, CleanFlags, CopyFlags,
-          InstallFlags, SDistFlags, RegisterFlags, HscolourFlags,
-          HaddockFlags, TestFlags, BenchmarkFlags)
-import Distribution.Simple.LocalBuildInfo (LocalBuildInfo)
+import Distribution.Simple.LocalBuildInfo
 
 type Args = [String]
 
@@ -178,7 +173,7 @@ emptyUserHooks
       preClean  = rn,
       cleanHook = ru,
       postClean = ru,
-      preCopy   = rn,
+      preCopy   = rn',
       copyHook  = ru,
       postCopy  = ru,
       preInst   = rn,
@@ -187,7 +182,7 @@ emptyUserHooks
       preSDist  = rn,
       sDistHook = ru,
       postSDist = ru,
-      preReg    = rn,
+      preReg    = rn',
       regHook   = ru,
       postReg   = ru,
       preUnreg  = rn,

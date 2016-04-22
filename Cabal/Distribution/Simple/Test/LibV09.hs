@@ -6,28 +6,24 @@ module Distribution.Simple.Test.LibV09
        , writeSimpleTestStub
        ) where
 
-import Distribution.Compat.CreatePipe ( createPipe )
-import Distribution.Compat.Environment ( getEnvironment )
-import Distribution.Compat.TempFile ( openTempFile )
-import Distribution.ModuleName ( ModuleName )
+import Distribution.Compat.CreatePipe
+import Distribution.Compat.Environment
+import Distribution.Compat.Internal.TempFile
+import Distribution.ModuleName
 import qualified Distribution.PackageDescription as PD
-import Distribution.Simple.Build.PathsModule ( pkgPathEnvVar )
-import Distribution.Simple.BuildPaths ( exeExtension )
-import Distribution.Simple.Compiler ( compilerInfo )
-import Distribution.Simple.Hpc ( guessWay, markupTest, tixDir, tixFilePath )
+import Distribution.Simple.Build.PathsModule
+import Distribution.Simple.BuildPaths
+import Distribution.Simple.Compiler
+import Distribution.Simple.Hpc
 import Distribution.Simple.InstallDirs
-    ( fromPathTemplate, initialPathTemplateEnv, PathTemplateVariable(..)
-    , substPathTemplate , toPathTemplate, PathTemplate )
 import qualified Distribution.Simple.LocalBuildInfo as LBI
 import Distribution.Simple.Setup
-    ( TestFlags(..), TestShowDetails(..), fromFlag, configCoverage )
 import Distribution.Simple.Test.Log
 import Distribution.Simple.Utils
-    ( die, debug, notice, createProcessWithEnv, addLibraryPath )
-import Distribution.System ( Platform (..) )
+import Distribution.System
 import Distribution.TestSuite
 import Distribution.Text
-import Distribution.Verbosity ( normal )
+import Distribution.Verbosity
 
 import Control.Exception ( bracket )
 import Control.Monad ( when, unless )
@@ -173,7 +169,7 @@ testOption pkg_descr lbi suite template =
     fromPathTemplate $ substPathTemplate env template
   where
     env = initialPathTemplateEnv
-          (PD.package pkg_descr) (LBI.localLibraryName lbi)
+          (PD.package pkg_descr) (LBI.localUnitId lbi)
           (compilerInfo $ LBI.compiler lbi) (LBI.hostPlatform lbi) ++
           [(TestSuiteNameVar, toPathTemplate $ PD.testName suite)]
 

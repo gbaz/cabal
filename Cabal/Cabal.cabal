@@ -1,5 +1,5 @@
 name: Cabal
-version: 1.23.0.0
+version: 1.25.0.0
 copyright: 2003-2006, Isaac Jones
            2005-2011, Duncan Coutts
 license: BSD3
@@ -19,23 +19,30 @@ description:
   organizing, and cataloging Haskell libraries and tools.
 category: Distribution
 cabal-version: >=1.10
-build-type: Custom
--- Even though we do use the default Setup.lhs it's vital to bootstrapping
--- that we build Setup.lhs using our own local Cabal source code.
+build-type: Simple
+-- If we use a new Cabal feature, this needs to be changed to Custom so
+-- we can bootstrap.
 
 extra-source-files:
   README.md tests/README.md changelog
-  doc/developing-packages.markdown doc/index.markdown
+  doc/Cabal.css doc/developing-packages.markdown doc/index.markdown
   doc/installing-packages.markdown
   doc/misc.markdown
 
-  -- Generated with 'misc/gen-extra-source-files.sh' & 'M-x sort-lines':
+  -- Generated with 'misc/gen-extra-source-files.sh'
+  -- Do NOT edit this section manually; instead, run the script.
+  -- BEGIN gen-extra-source-files
+  tests/PackageTests/AllowNewer/AllowNewer.cabal
+  tests/PackageTests/AllowNewer/benchmarks/Bench.hs
+  tests/PackageTests/AllowNewer/src/Foo.hs
+  tests/PackageTests/AllowNewer/tests/Test.hs
   tests/PackageTests/BenchmarkExeV10/Foo.hs
   tests/PackageTests/BenchmarkExeV10/benchmarks/bench-Foo.hs
   tests/PackageTests/BenchmarkExeV10/my.cabal
   tests/PackageTests/BenchmarkOptions/BenchmarkOptions.cabal
   tests/PackageTests/BenchmarkOptions/test-BenchmarkOptions.hs
   tests/PackageTests/BenchmarkStanza/my.cabal
+  tests/PackageTests/BuildAssumeDepsUpToDate/BuildAssumeDepsUpToDate.cabal
   tests/PackageTests/BuildDeps/GlobalBuildDepsNotAdditive1/GlobalBuildDepsNotAdditive1.cabal
   tests/PackageTests/BuildDeps/GlobalBuildDepsNotAdditive1/MyLibrary.hs
   tests/PackageTests/BuildDeps/GlobalBuildDepsNotAdditive2/GlobalBuildDepsNotAdditive2.cabal
@@ -74,18 +81,85 @@ extra-source-files:
   tests/PackageTests/BuildDeps/TargetSpecificDeps3/MyLibrary.hs
   tests/PackageTests/BuildDeps/TargetSpecificDeps3/lemon.hs
   tests/PackageTests/BuildDeps/TargetSpecificDeps3/my.cabal
+  tests/PackageTests/BuildTestSuiteDetailedV09/Dummy2.hs
+  tests/PackageTests/BuildableField/BuildableField.cabal
+  tests/PackageTests/BuildableField/Main.hs
   tests/PackageTests/CMain/Bar.hs
-  tests/PackageTests/CMain/Setup.hs
   tests/PackageTests/CMain/foo.c
   tests/PackageTests/CMain/my.cabal
+  tests/PackageTests/Configure/A.hs
+  tests/PackageTests/Configure/Setup.hs
+  tests/PackageTests/Configure/X11.buildinfo.in
+  tests/PackageTests/Configure/X11.cabal
+  tests/PackageTests/Configure/include/HsX11Config.h.in
+  tests/PackageTests/CopyAssumeDepsUpToDate/CopyAssumeDepsUpToDate.cabal
+  tests/PackageTests/CopyAssumeDepsUpToDate/Main.hs
+  tests/PackageTests/CopyAssumeDepsUpToDate/P.hs
+  tests/PackageTests/CopyComponent/Exe/Main.hs
+  tests/PackageTests/CopyComponent/Exe/Main2.hs
+  tests/PackageTests/CopyComponent/Exe/myprog.cabal
+  tests/PackageTests/CopyComponent/Lib/Main.hs
+  tests/PackageTests/CopyComponent/Lib/p.cabal
+  tests/PackageTests/CopyComponent/Lib/src/P.hs
+  tests/PackageTests/CustomPreProcess/Hello.hs
+  tests/PackageTests/CustomPreProcess/MyCustomPreprocessor.hs
+  tests/PackageTests/CustomPreProcess/Setup.hs
+  tests/PackageTests/CustomPreProcess/internal-preprocessor-test.cabal
   tests/PackageTests/DeterministicAr/Lib.hs
   tests/PackageTests/DeterministicAr/my.cabal
+  tests/PackageTests/DuplicateModuleName/DuplicateModuleName.cabal
+  tests/PackageTests/DuplicateModuleName/src/Foo.hs
+  tests/PackageTests/DuplicateModuleName/tests/Foo.hs
+  tests/PackageTests/DuplicateModuleName/tests2/Foo.hs
   tests/PackageTests/EmptyLib/empty/empty.cabal
+  tests/PackageTests/GhcPkgGuess/SameDirectory/SameDirectory.cabal
+  tests/PackageTests/GhcPkgGuess/SameDirectory/ghc
+  tests/PackageTests/GhcPkgGuess/SameDirectory/ghc-pkg
+  tests/PackageTests/GhcPkgGuess/SameDirectoryGhcVersion/SameDirectory.cabal
+  tests/PackageTests/GhcPkgGuess/SameDirectoryGhcVersion/ghc-7.10
+  tests/PackageTests/GhcPkgGuess/SameDirectoryGhcVersion/ghc-pkg-ghc-7.10
+  tests/PackageTests/GhcPkgGuess/SameDirectoryVersion/SameDirectory.cabal
+  tests/PackageTests/GhcPkgGuess/SameDirectoryVersion/ghc-7.10
+  tests/PackageTests/GhcPkgGuess/SameDirectoryVersion/ghc-pkg-7.10
+  tests/PackageTests/GhcPkgGuess/Symlink/SameDirectory.cabal
+  tests/PackageTests/GhcPkgGuess/Symlink/bin/ghc
+  tests/PackageTests/GhcPkgGuess/Symlink/bin/ghc-pkg
+  tests/PackageTests/GhcPkgGuess/SymlinkGhcVersion/SameDirectory.cabal
+  tests/PackageTests/GhcPkgGuess/SymlinkGhcVersion/bin/ghc-7.10
+  tests/PackageTests/GhcPkgGuess/SymlinkGhcVersion/bin/ghc-pkg-7.10
+  tests/PackageTests/GhcPkgGuess/SymlinkVersion/SameDirectory.cabal
+  tests/PackageTests/GhcPkgGuess/SymlinkVersion/bin/ghc-7.10
+  tests/PackageTests/GhcPkgGuess/SymlinkVersion/bin/ghc-pkg-ghc-7.10
   tests/PackageTests/Haddock/CPP.hs
   tests/PackageTests/Haddock/Literate.lhs
   tests/PackageTests/Haddock/NoCPP.hs
   tests/PackageTests/Haddock/Simple.hs
   tests/PackageTests/Haddock/my.cabal
+  tests/PackageTests/HaddockNewline/A.hs
+  tests/PackageTests/HaddockNewline/HaddockNewline.cabal
+  tests/PackageTests/HaddockNewline/Setup.hs
+  tests/PackageTests/InternalLibraries/Executable/exe/Main.hs
+  tests/PackageTests/InternalLibraries/Executable/foo.cabal
+  tests/PackageTests/InternalLibraries/Executable/src/Foo.hs
+  tests/PackageTests/InternalLibraries/Library/fooexe/Main.hs
+  tests/PackageTests/InternalLibraries/Library/fooexe/fooexe.cabal
+  tests/PackageTests/InternalLibraries/Library/foolib/Foo.hs
+  tests/PackageTests/InternalLibraries/Library/foolib/foolib.cabal
+  tests/PackageTests/InternalLibraries/Library/foolib/private/Internal.hs
+  tests/PackageTests/InternalLibraries/p/Foo.hs
+  tests/PackageTests/InternalLibraries/p/p.cabal
+  tests/PackageTests/InternalLibraries/p/p/P.hs
+  tests/PackageTests/InternalLibraries/p/q/Q.hs
+  tests/PackageTests/InternalLibraries/q/Q.hs
+  tests/PackageTests/InternalLibraries/q/q.cabal
+  tests/PackageTests/InternalLibraries/r/R.hs
+  tests/PackageTests/InternalLibraries/r/r.cabal
+  tests/PackageTests/Macros/A.hs
+  tests/PackageTests/Macros/B.hs
+  tests/PackageTests/Macros/Main.hs
+  tests/PackageTests/Macros/macros.cabal
+  tests/PackageTests/Macros/src/C.hs
+  tests/PackageTests/Options.hs
   tests/PackageTests/OrderFlags/Foo.hs
   tests/PackageTests/OrderFlags/my.cabal
   tests/PackageTests/PathsModule/Executable/Main.hs
@@ -94,7 +168,14 @@ extra-source-files:
   tests/PackageTests/PreProcess/Foo.hsc
   tests/PackageTests/PreProcess/Main.hs
   tests/PackageTests/PreProcess/my.cabal
+  tests/PackageTests/PreProcessExtraSources/Foo.hsc
+  tests/PackageTests/PreProcessExtraSources/Main.hs
+  tests/PackageTests/PreProcessExtraSources/my.cabal
   tests/PackageTests/ReexportedModules/ReexportedModules.cabal
+  tests/PackageTests/RegisterAssumeDepsUpToDate/P.hs
+  tests/PackageTests/RegisterAssumeDepsUpToDate/RegisterOneShot.cabal
+  tests/PackageTests/RegisterAssumeDepsUpToDate/q/Q.hs
+  tests/PackageTests/Regression/T3294/T3294.cabal
   tests/PackageTests/TemplateHaskell/dynamic/Exe.hs
   tests/PackageTests/TemplateHaskell/dynamic/Lib.hs
   tests/PackageTests/TemplateHaskell/dynamic/TH.hs
@@ -107,20 +188,33 @@ extra-source-files:
   tests/PackageTests/TemplateHaskell/vanilla/Lib.hs
   tests/PackageTests/TemplateHaskell/vanilla/TH.hs
   tests/PackageTests/TemplateHaskell/vanilla/my.cabal
+  tests/PackageTests/TestNameCollision/child/Child.hs
+  tests/PackageTests/TestNameCollision/child/child.cabal
+  tests/PackageTests/TestNameCollision/child/tests/Test.hs
+  tests/PackageTests/TestNameCollision/parent/Parent.hs
+  tests/PackageTests/TestNameCollision/parent/parent.cabal
   tests/PackageTests/TestOptions/TestOptions.cabal
   tests/PackageTests/TestOptions/test-TestOptions.hs
   tests/PackageTests/TestStanza/my.cabal
   tests/PackageTests/TestSuiteTests/ExeV10/Foo.hs
   tests/PackageTests/TestSuiteTests/ExeV10/my.cabal
   tests/PackageTests/TestSuiteTests/ExeV10/tests/test-Foo.hs
-  tests/PackageTests/TestSuiteTests/LibV09/LibV09.cabal
+  tests/PackageTests/TestSuiteTests/ExeV10/tests/test-Short.hs
   tests/PackageTests/TestSuiteTests/LibV09/Lib.hs
+  tests/PackageTests/TestSuiteTests/LibV09/LibV09.cabal
   tests/PackageTests/TestSuiteTests/LibV09/tests/Deadlock.hs
+  tests/PackageTests/Tests.hs
+  tests/PackageTests/UniqueIPID/P1/M.hs
+  tests/PackageTests/UniqueIPID/P1/my.cabal
+  tests/PackageTests/UniqueIPID/P2/M.hs
+  tests/PackageTests/UniqueIPID/P2/my.cabal
+  tests/PackageTests/multInst/my.cabal
   tests/Setup.hs
   tests/hackage/check.sh
   tests/hackage/download.sh
   tests/hackage/unpack.sh
   tests/misc/ghc-supported-languages.hs
+  -- END gen-extra-source-files
 
 source-repository head
   type:     git
@@ -130,23 +224,33 @@ source-repository head
 flag bundled-binary-generic
   default: False
 
+flag old-directory
+  description:  Use directory < 1.2 and old-time
+  default:      False
+
 library
   build-depends:
-    base       >= 4.4 && < 5,
-    deepseq    >= 1.3 && < 1.5,
-    filepath   >= 1   && < 1.5,
-    directory  >= 1   && < 1.3,
-    process    >= 1.1.0.1 && < 1.4,
-    time       >= 1.1 && < 1.6,
-    containers >= 0.1 && < 0.6,
     array      >= 0.1 && < 0.6,
-    pretty     >= 1   && < 1.2,
-    bytestring >= 0.9
+    base       >= 4.5 && < 5,
+    bytestring >= 0.9 && < 1,
+    containers >= 0.4 && < 0.6,
+    deepseq    >= 1.3 && < 1.5,
+    filepath   >= 1.3 && < 1.5,
+    pretty     >= 1.1 && < 1.2,
+    process    >= 1.1.0.1 && < 1.5,
+    time       >= 1.4 && < 1.7
+
+  if flag(old-directory)
+    build-depends: directory >= 1.1 && < 1.2, old-time >= 1 && < 1.2,
+                   process   >= 1.0.1.1  && < 1.1.0.2
+  else
+    build-depends: directory >= 1.2 && < 1.3,
+                   process   >= 1.1.0.2  && < 1.5
 
   if flag(bundled-binary-generic)
     build-depends: binary >= 0.5 && < 0.7
   else
-    build-depends: binary >= 0.7 && < 0.8
+    build-depends: binary >= 0.7 && < 0.9
 
   -- Needed for GHC.Generics before GHC 7.6
   if impl(ghc < 7.6)
@@ -154,15 +258,25 @@ library
 
   if !os(windows)
     build-depends:
-      unix >= 2.0 && < 2.8
+      unix >= 2.5 && < 2.8
+
+  if os(windows)
+    build-depends:
+      Win32 >= 2.2 && < 2.4
 
   ghc-options: -Wall -fno-ignore-asserts -fwarn-tabs
+  if impl(ghc >= 8.0)
+    ghc-options: -Wcompat -Wnoncanonical-monad-instances
+                 -Wnoncanonical-monadfail-instances
 
   exposed-modules:
     Distribution.Compat.CreatePipe
     Distribution.Compat.Environment
     Distribution.Compat.Exception
+    Distribution.Compat.Internal.TempFile
     Distribution.Compat.ReadP
+    Distribution.Compat.Semigroup
+    Distribution.Compat.Time
     Distribution.Compiler
     Distribution.InstalledPackageInfo
     Distribution.License
@@ -232,16 +346,17 @@ library
     Distribution.Verbosity
     Distribution.Version
     Language.Haskell.Extension
+    Distribution.Compat.Binary
 
   other-modules:
-    Distribution.Compat.Binary
     Distribution.Compat.CopyFile
-    Distribution.Compat.TempFile
+    Distribution.Compat.GetShortPathName
+    Distribution.Compat.MonadFail
     Distribution.GetOpt
     Distribution.Lex
     Distribution.Simple.GHC.Internal
-    Distribution.Simple.GHC.IPI641
     Distribution.Simple.GHC.IPI642
+    Distribution.Simple.GHC.IPIConvert
     Distribution.Simple.GHC.ImplInfo
     Paths_Cabal
 
@@ -251,25 +366,33 @@ library
       Distribution.Compat.Binary.Generic
 
   default-language: Haskell98
-  default-extensions: CPP
 
 -- Small, fast running tests.
 test-suite unit-tests
   type: exitcode-stdio-1.0
   hs-source-dirs: tests
   other-modules:
+    Test.Laws
+    Test.QuickCheck.Utils
     UnitTests.Distribution.Compat.CreatePipe
     UnitTests.Distribution.Compat.ReadP
+    UnitTests.Distribution.Compat.Time
     UnitTests.Distribution.Simple.Program.Internal
+    UnitTests.Distribution.Simple.Utils
+    UnitTests.Distribution.System
     UnitTests.Distribution.Utils.NubList
+    UnitTests.Distribution.Version
   main-is: UnitTests.hs
   build-depends:
     base,
+    directory,
+    filepath,
     tasty,
     tasty-hunit,
     tasty-quickcheck,
+    tagged,
     pretty,
-    QuickCheck < 2.9,
+    QuickCheck >= 2.7 && < 2.9,
     Cabal
   ghc-options: -Wall
   default-language: Haskell98
@@ -279,57 +402,29 @@ test-suite package-tests
   type: exitcode-stdio-1.0
   main-is: PackageTests.hs
   other-modules:
-    PackageTests.BenchmarkExeV10.Check
-    PackageTests.BenchmarkOptions.Check
     PackageTests.BenchmarkStanza.Check
-    PackageTests.BuildDeps.GlobalBuildDepsNotAdditive1.Check
-    PackageTests.BuildDeps.GlobalBuildDepsNotAdditive2.Check
-    PackageTests.BuildDeps.InternalLibrary0.Check
-    PackageTests.BuildDeps.InternalLibrary1.Check
-    PackageTests.BuildDeps.InternalLibrary2.Check
-    PackageTests.BuildDeps.InternalLibrary3.Check
-    PackageTests.BuildDeps.InternalLibrary4.Check
-    PackageTests.BuildDeps.SameDepsAllRound.Check
-    PackageTests.BuildDeps.TargetSpecificDeps1.Check
-    PackageTests.BuildDeps.TargetSpecificDeps2.Check
-    PackageTests.BuildDeps.TargetSpecificDeps3.Check
-    PackageTests.CMain.Check
-    PackageTests.DeterministicAr.Check
-    PackageTests.EmptyLib.Check
-    PackageTests.Haddock.Check
-    PackageTests.OrderFlags.Check
-    PackageTests.PackageTester
-    PackageTests.PathsModule.Executable.Check
-    PackageTests.PathsModule.Library.Check
-    PackageTests.PreProcess.Check
-    PackageTests.PreProcessExtraSources.Check
-    PackageTests.ReexportedModules.Check
-    PackageTests.TemplateHaskell.Check
-    PackageTests.TestOptions.Check
     PackageTests.TestStanza.Check
+    PackageTests.DeterministicAr.Check
     PackageTests.TestSuiteTests.ExeV10.Check
-    PackageTests.TestSuiteTests.LibV09.Check
-    Test.Distribution.Version
-    Test.Laws
-    Test.QuickCheck.Utils
+    PackageTests.PackageTester
   hs-source-dirs: tests
   build-depends:
     base,
     containers,
+    tagged,
     tasty,
-    tasty-quickcheck,
     tasty-hunit,
-    QuickCheck >= 2.1.0.1 && < 2.9,
+    transformers,
+    time,
     Cabal,
     process,
     directory,
     filepath,
-    extensible-exceptions,
     bytestring,
     regex-posix,
     old-time
   if !os(windows)
-    build-depends: unix
-  ghc-options: -Wall
+    build-depends: unix, exceptions
+  ghc-options: -Wall -rtsopts
   default-extensions: CPP
   default-language: Haskell98

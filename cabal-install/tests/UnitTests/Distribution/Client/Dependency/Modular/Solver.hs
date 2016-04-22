@@ -1,20 +1,27 @@
 {-# LANGUAGE RecordWildCards #-}
-{-# LANGUAGE DeriveDataTypeable #-}
-module UnitTests.Distribution.Client.Dependency.Modular.Solver (tests, options) where
+module UnitTests.Distribution.Client.Dependency.Modular.Solver (tests)
+       where
 
 -- base
 import Control.Monad
 import Data.Maybe (isNothing)
-import Data.Proxy
-import Data.Typeable
+
+import qualified Data.Version         as V
+import qualified Distribution.Version as V
 
 -- test-framework
 import Test.Tasty as TF
 import Test.Tasty.HUnit (testCase, assertEqual, assertBool)
-import Test.Tasty.Options
+
+-- Cabal
+import Language.Haskell.Extension ( Extension(..)
+                                  , KnownExtension(..), Language(..))
 
 -- cabal-install
+import Distribution.Client.PkgConfigDb (PkgConfigDb, pkgConfigDbFromList)
+import Distribution.Client.Dependency.Types (Solver(Modular))
 import UnitTests.Distribution.Client.Dependency.Modular.DSL
+import UnitTests.Options
 
 tests :: [TF.TestTree]
 tests = [
@@ -67,39 +74,155 @@ tests = [
         , runTest $ mkTest db12 "baseShim5" ["D"] Nothing
         , runTest $ mkTest db12 "baseShim6" ["E"] (Just [("E", 1), ("syb", 2)])
         ]
+    , testGroup "Cycles" [
+          runTest $ mkTest db14 "simpleCycle1"          ["A"]      Nothing
+        , runTest $ mkTest db14 "simpleCycle2"          ["A", "B"] Nothing
+        , runTest $ mkTest db14 "cycleWithFlagChoice1"  ["C"]      (Just [("C", 1), ("E", 1)])
+        , runTest $ mkTest db15 "cycleThroughSetupDep1" ["A"]      Nothing
+        , runTest $ mkTest db15 "cycleThroughSetupDep2" ["B"]      Nothing
+        , runTest $ mkTest db15 "cycleThroughSetupDep3" ["C"]      (Just [("C", 2), ("D", 1)])
+        , runTest $ mkTest db15 "cycleThroughSetupDep4" ["D"]      (Just [("D", 1)])
+        , runTest $ mkTest db15 "cycleThroughSetupDep5" ["E"]      (Just [("C", 2), ("D", 1), ("E", 1)])
+        ]
+    , testGroup "Extensions" [
+          runTest $ mkTestExts [EnableExtension CPP] dbExts1 "unsupported" ["A"] Nothing
+        , runTest $ mkTestExts [EnableExtension CPP] dbExts1 "unsupportedIndirect" ["B"] Nothing
+        , runTest $ mkTestExts [EnableExtension RankNTypes] dbExts1 "supported" ["A"] (Just [("A",1)])
+        , runTest $ mkTestExts (map EnableExtension [CPP,RankNTypes]) dbExts1 "supportedIndirect" ["C"] (Just [("A",1),("B",1), ("C",1)])
+        , runTest $ mkTestExts [EnableExtension CPP] dbExts1 "disabledExtension" ["D"] Nothing
+        , runTest $ mkTestExts (map EnableExtension [CPP,RankNTypes]) dbExts1 "disabledExtension" ["D"] Nothing
+        , runTest $ mkTestExts (UnknownExtension "custom" : map EnableExtension [CPP,RankNTypes]) dbExts1 "supportedUnknown" ["E"] (Just [("A",1),("B",1),("C",1),("E",1)])
+        ]
+    , testGroup "Languages" [
+          runTest $ mkTestLangs [Haskell98] dbLangs1 "unsupported" ["A"] Nothing
+        , runTest $ mkTestLangs [Haskell98,Haskell2010] dbLangs1 "supported" ["A"] (Just [("A",1)])
+        , runTest $ mkTestLangs [Haskell98] dbLangs1 "unsupportedIndirect" ["B"] Nothing
+        , runTest $ mkTestLangs [Haskell98, Haskell2010, UnknownLanguage "Haskell3000"] dbLangs1 "supportedUnknown" ["C"] (Just [("A",1),("B",1),("C",1)])
+        ]
+
+     , testGroup "Soft Constraints" [
+          runTest $ soft [ ExPref "A" $ mkvrThis 1]      $ mkTest db13 "selectPreferredVersionSimple" ["A"] (Just [("A", 1)])
+        , runTest $ soft [ ExPref "A" $ mkvrOrEarlier 2] $ mkTest db13 "selectPreferredVersionSimple2" ["A"] (Just [("A", 2)])
+        , runTest $ soft [ ExPref "A" $ mkvrOrEarlier 2
+                         , ExPref "A" $ mkvrOrEarlier 1] $ mkTest db13 "selectPreferredVersionMultiple" ["A"] (Just [("A", 1)])
+        , runTest $ soft [ ExPref "A" $ mkvrOrEarlier 1
+                         , ExPref "A" $ mkvrOrEarlier 2] $ mkTest db13 "selectPreferredVersionMultiple2" ["A"] (Just [("A", 1)])
+        , runTest $ soft [ ExPref "A" $ mkvrThis 1
+                         , ExPref "A" $ mkvrThis 2] $ mkTest db13 "selectPreferredVersionMultiple3" ["A"] (Just [("A", 2)])
+        , runTest $ soft [ ExPref "A" $ mkvrThis 1
+                         , ExPref "A" $ mkvrOrEarlier 2] $ mkTest db13 "selectPreferredVersionMultiple4" ["A"] (Just [("A", 1)])
+        ]
+     , testGroup "Buildable Field" [
+          testBuildable "avoid building component with unknown dependency" (ExAny "unknown")
+        , testBuildable "avoid building component with unknown extension" (ExExt (UnknownExtension "unknown"))
+        , testBuildable "avoid building component with unknown language" (ExLang (UnknownLanguage "unknown"))
+        , runTest $ mkTest dbBuildable1 "choose flags that set buildable to false" ["pkg"] (Just [("flag1-false", 1), ("flag2-true", 1), ("pkg", 1)])
+        , runTest $ mkTest dbBuildable2 "choose version that sets buildable to false" ["A"] (Just [("A", 1), ("B", 2)])
+         ]
+    , testGroup "Pkg-config dependencies" [
+          runTest $ mkTestPCDepends [] dbPC1 "noPkgs" ["A"] Nothing
+        , runTest $ mkTestPCDepends [("pkgA", "0")] dbPC1 "tooOld" ["A"] Nothing
+        , runTest $ mkTestPCDepends [("pkgA", "1.0.0"), ("pkgB", "1.0.0")] dbPC1 "pruneNotFound" ["C"] (Just [("A", 1), ("B", 1), ("C", 1)])
+        , runTest $ mkTestPCDepends [("pkgA", "1.0.0"), ("pkgB", "2.0.0")] dbPC1 "chooseNewest" ["C"] (Just [("A", 1), ("B", 2), ("C", 1)])
+        ]
     ]
   where
-    indep test = test { testIndepGoals = True }
+    -- | Combinator to turn on --independent-goals behavior, i.e. solve
+    -- for the goals as if we were solving for each goal independently.
+    -- (This doesn't really work well at the moment, see #2842)
+    indep test      = test { testIndepGoals = IndepGoals True }
+    soft prefs test = test { testSoftConstraints = prefs }
+    mkvrThis        = V.thisVersion . makeV
+    mkvrOrEarlier   = V.orEarlierVersion . makeV
+    makeV v         = V.Version [v,0,0] []
 
 {-------------------------------------------------------------------------------
   Solver tests
 -------------------------------------------------------------------------------}
 
 data SolverTest = SolverTest {
-    testLabel      :: String
-  , testTargets    :: [String]
-  , testResult     :: Maybe [(String, Int)]
-  , testIndepGoals :: Bool
-  , testDb         :: ExampleDb
+    testLabel          :: String
+  , testTargets        :: [String]
+  , testResult         :: Maybe [(String, Int)]
+  , testIndepGoals     :: IndepGoals
+  , testSoftConstraints :: [ExPreference]
+  , testDb             :: ExampleDb
+  , testSupportedExts  :: Maybe [Extension]
+  , testSupportedLangs :: Maybe [Language]
+  , testPkgConfigDb    :: PkgConfigDb
   }
 
+-- | Makes a solver test case, consisting of the following components:
+--
+--      1. An 'ExampleDb', representing the package database (both
+--         installed and remote) we are doing dependency solving over,
+--      2. A 'String' name for the test,
+--      3. A list '[String]' of package names to solve for
+--      4. The expected result, either 'Nothing' if there is no
+--         satisfying solution, or a list '[(String, Int)]' of
+--         packages to install, at which versions.
+--
+-- See 'UnitTests.Distribution.Client.Dependency.Modular.DSL' for how
+-- to construct an 'ExampleDb', as well as definitions of 'db1' etc.
+-- in this file.
 mkTest :: ExampleDb
        -> String
        -> [String]
        -> Maybe [(String, Int)]
        -> SolverTest
-mkTest db label targets result = SolverTest {
-    testLabel      = label
-  , testTargets    = targets
-  , testResult     = result
-  , testIndepGoals = False
-  , testDb         = db
+mkTest = mkTestExtLangPC Nothing Nothing []
+
+mkTestExts :: [Extension]
+           -> ExampleDb
+           -> String
+           -> [String]
+           -> Maybe [(String, Int)]
+           -> SolverTest
+mkTestExts exts = mkTestExtLangPC (Just exts) Nothing []
+
+mkTestLangs :: [Language]
+            -> ExampleDb
+            -> String
+            -> [String]
+            -> Maybe [(String, Int)]
+            -> SolverTest
+mkTestLangs langs = mkTestExtLangPC Nothing (Just langs) []
+
+mkTestPCDepends :: [(String, String)]
+                -> ExampleDb
+                -> String
+                -> [String]
+                -> Maybe [(String, Int)]
+                -> SolverTest
+mkTestPCDepends pkgConfigDb = mkTestExtLangPC Nothing Nothing pkgConfigDb
+
+mkTestExtLangPC :: Maybe [Extension]
+                -> Maybe [Language]
+                -> [(String, String)]
+                -> ExampleDb
+                -> String
+                -> [String]
+                -> Maybe [(String, Int)]
+                -> SolverTest
+mkTestExtLangPC exts langs pkgConfigDb db label targets result = SolverTest {
+    testLabel          = label
+  , testTargets        = targets
+  , testResult         = result
+  , testIndepGoals     = IndepGoals False
+  , testSoftConstraints = []
+  , testDb             = db
+  , testSupportedExts  = exts
+  , testSupportedLangs = langs
+  , testPkgConfigDb    = pkgConfigDbFromList pkgConfigDb
   }
 
 runTest :: SolverTest -> TF.TestTree
 runTest SolverTest{..} = askOption $ \(OptionShowSolverLog showSolverLog) ->
     testCase testLabel $ do
-      let (_msgs, result) = exResolve testDb testTargets testIndepGoals
+      let (_msgs, result) = exResolve testDb testSupportedExts
+                            testSupportedLangs testPkgConfigDb testTargets
+                            Modular Nothing testIndepGoals (ReorderGoals False)
+                            testSoftConstraints
       when showSolverLog $ mapM_ putStrLn _msgs
       case result of
         Left  err  -> assertBool ("Unexpected error:\n" ++ err) (isNothing testResult)
@@ -139,27 +262,27 @@ db3 :: ExampleDb
 db3 = [
      Right $ exAv "A" 1 []
    , Right $ exAv "A" 2 []
-   , Right $ exAv "B" 1 [ExFlag "flagB" [ExFix "A" 1] [ExFix "A" 2]]
+   , Right $ exAv "B" 1 [exFlag "flagB" [ExFix "A" 1] [ExFix "A" 2]]
    , Right $ exAv "C" 1 [ExFix "A" 1, ExAny "B"]
    , Right $ exAv "D" 1 [ExFix "A" 2, ExAny "B"]
    ]
 
--- | Like exampleDb2, but the flag picks a different package rather than a
+-- | Like db3, but the flag picks a different package rather than a
 -- different package version
 --
--- In exampleDb2 we cannot install C and D as independent goals because:
+-- In db3 we cannot install C and D as independent goals because:
 --
 -- * The multiple instance restriction says C and D _must_ share B
--- * Since C relies on A.1, C needs B to be compiled with flagB on
--- * Since D relies on A.2, D needs B to be compiled with flagsB off
+-- * Since C relies on A-1, C needs B to be compiled with flagB on
+-- * Since D relies on A-2, D needs B to be compiled with flagB off
 -- * Hence C and D have incompatible requirements on B's flags.
 --
 -- However, _even_ if we don't check explicitly that we pick the same flag
 -- assignment for 0.B and 1.B, we will still detect the problem because
 -- 0.B depends on 0.A-1, 1.B depends on 1.A-2, hence we cannot link 0.A to
--- 1.B and therefore we cannot link 0.B to 1.B.
+-- 1.A and therefore we cannot link 0.B to 1.B.
 --
--- In exampleDb3 the situation however is trickier. We again cannot install
+-- In db4 the situation however is trickier. We again cannot install
 -- packages C and D as independent goals because:
 --
 -- * As above, the multiple instance restriction says that C and D _must_ share B
@@ -171,10 +294,10 @@ db3 = [
 -- we don't see the problem:
 --
 -- * We link 0.B to 1.B
--- * 0.B relies on Ay.1
--- * 1.B relies on Ax.1
+-- * 0.B relies on Ay-1
+-- * 1.B relies on Ax-1
 --
--- We will insist that 0.Ay will be linked to 1.Ay, and 0.Ax to 1.A, but since
+-- We will insist that 0.Ay will be linked to 1.Ay, and 0.Ax to 1.Ax, but since
 -- we only ever assign to one of these, these constraints are never broken.
 db4 :: ExampleDb
 db4 = [
@@ -182,7 +305,7 @@ db4 = [
    , Right $ exAv "Ax" 2 []
    , Right $ exAv "Ay" 1 []
    , Right $ exAv "Ay" 2 []
-   , Right $ exAv "B"  1 [ExFlag "flagB" [ExFix "Ax" 1] [ExFix "Ay" 1]]
+   , Right $ exAv "B"  1 [exFlag "flagB" [ExFix "Ax" 1] [ExFix "Ay" 1]]
    , Right $ exAv "C"  1 [ExFix "Ax" 2, ExAny "B"]
    , Right $ exAv "D"  1 [ExFix "Ay" 2, ExAny "B"]
    ]
@@ -207,11 +330,11 @@ db5 = [
     Right $ exAv "A" 1 []
   , Right $ exAv "A" 2 []
   , Right $ exAv "B" 1 []
-  , Right $ exAv "C" 1 [ExTest "testC" [ExAny "A"]]
-  , Right $ exAv "D" 1 [ExTest "testD" [ExFix "B" 2]]
-  , Right $ exAv "E" 1 [ExFix "A" 1, ExTest "testE" [ExAny "A"]]
-  , Right $ exAv "F" 1 [ExFix "A" 1, ExTest "testF" [ExFix "A" 2]]
-  , Right $ exAv "G" 1 [ExFix "A" 2, ExTest "testG" [ExAny "A"]]
+  , Right $ exAv "C" 1 [] `withTest` ExTest "testC" [ExAny "A"]
+  , Right $ exAv "D" 1 [] `withTest` ExTest "testD" [ExFix "B" 2]
+  , Right $ exAv "E" 1 [ExFix "A" 1] `withTest` ExTest "testE" [ExAny "A"]
+  , Right $ exAv "F" 1 [ExFix "A" 1] `withTest` ExTest "testF" [ExFix "A" 2]
+  , Right $ exAv "G" 1 [ExFix "A" 2] `withTest` ExTest "testG" [ExAny "A"]
   ]
 
 -- Now the _dependencies_ have test suites
@@ -226,7 +349,7 @@ db6 :: ExampleDb
 db6 = [
     Right $ exAv "A" 1 []
   , Right $ exAv "A" 2 []
-  , Right $ exAv "B" 1 [ExTest "testA" [ExAny "A"]]
+  , Right $ exAv "B" 1 [] `withTest` ExTest "testA" [ExAny "A"]
   , Right $ exAv "C" 1 [ExFix "A" 1, ExAny "B"]
   , Right $ exAv "D" 1 [ExAny "B"]
   ]
@@ -340,21 +463,127 @@ db12 =
     , Right $ exAv "E" 1 [ExFix "base" 4, ExFix "syb" 2]
     ]
 
-{-------------------------------------------------------------------------------
-  Test options
--------------------------------------------------------------------------------}
-
-options :: [OptionDescription]
-options = [
-    Option (Proxy :: Proxy OptionShowSolverLog)
+db13 :: ExampleDb
+db13 = [
+    Right $ exAv "A" 1 []
+  , Right $ exAv "A" 2 []
+  , Right $ exAv "A" 3 []
   ]
 
-newtype OptionShowSolverLog = OptionShowSolverLog Bool
-  deriving Typeable
+-- | Database with some cycles
+--
+-- * Simplest non-trivial cycle: A -> B and B -> A
+-- * There is a cycle C -> D -> C, but it can be broken by picking the
+--   right flag assignment.
+db14 :: ExampleDb
+db14 = [
+    Right $ exAv "A" 1 [ExAny "B"]
+  , Right $ exAv "B" 1 [ExAny "A"]
+  , Right $ exAv "C" 1 [exFlag "flagC" [ExAny "D"] [ExAny "E"]]
+  , Right $ exAv "D" 1 [ExAny "C"]
+  , Right $ exAv "E" 1 []
+  ]
 
-instance IsOption OptionShowSolverLog where
-  defaultValue   = OptionShowSolverLog False
-  parseValue     = fmap OptionShowSolverLog . safeRead
-  optionName     = return "show-solver-log"
-  optionHelp     = return "Show full log from the solver"
-  optionCLParser = flagCLParser Nothing (OptionShowSolverLog True)
+-- | Cycles through setup dependencies
+--
+-- The first cycle is unsolvable: package A has a setup dependency on B,
+-- B has a regular dependency on A, and we only have a single version available
+-- for both.
+--
+-- The second cycle can be broken by picking different versions: package C-2.0
+-- has a setup dependency on D, and D has a regular dependency on C-*. However,
+-- version C-1.0 is already available (perhaps it didn't have this setup dep).
+-- Thus, we should be able to break this cycle even if we are installing package
+-- E, which explictly depends on C-2.0.
+db15 :: ExampleDb
+db15 = [
+    -- First example (real cycle, no solution)
+    Right $ exAv   "A" 1            []            `withSetupDeps` [ExAny "B"]
+  , Right $ exAv   "B" 1            [ExAny "A"]
+    -- Second example (cycle can be broken by picking versions carefully)
+  , Left  $ exInst "C" 1 "C-1-inst" []
+  , Right $ exAv   "C" 2            []            `withSetupDeps` [ExAny "D"]
+  , Right $ exAv   "D" 1            [ExAny "C"  ]
+  , Right $ exAv   "E" 1            [ExFix "C" 2]
+  ]
+
+
+dbExts1 :: ExampleDb
+dbExts1 = [
+    Right $ exAv "A" 1 [ExExt (EnableExtension RankNTypes)]
+  , Right $ exAv "B" 1 [ExExt (EnableExtension CPP), ExAny "A"]
+  , Right $ exAv "C" 1 [ExAny "B"]
+  , Right $ exAv "D" 1 [ExExt (DisableExtension CPP), ExAny "B"]
+  , Right $ exAv "E" 1 [ExExt (UnknownExtension "custom"), ExAny "C"]
+  ]
+
+dbLangs1 :: ExampleDb
+dbLangs1 = [
+    Right $ exAv "A" 1 [ExLang Haskell2010]
+  , Right $ exAv "B" 1 [ExLang Haskell98, ExAny "A"]
+  , Right $ exAv "C" 1 [ExLang (UnknownLanguage "Haskell3000"), ExAny "B"]
+  ]
+
+-- | cabal must set enable-lib to false in order to avoid the unavailable
+-- dependency. Flags are true by default. The flag choice causes "pkg" to
+-- depend on "false-dep".
+testBuildable :: String -> ExampleDependency -> TestTree
+testBuildable testName unavailableDep =
+    runTest $ mkTestExtLangPC (Just []) (Just []) [] db testName ["pkg"] expected
+  where
+    expected = Just [("false-dep", 1), ("pkg", 1)]
+    db = [
+        Right $ exAv "pkg" 1
+            [ unavailableDep
+            , ExFlag "enable-lib" (Buildable []) NotBuildable ]
+         `withTest`
+            ExTest "test" [exFlag "enable-lib"
+                              [ExAny "true-dep"]
+                              [ExAny "false-dep"]]
+      , Right $ exAv "true-dep" 1 []
+      , Right $ exAv "false-dep" 1 []
+      ]
+
+-- | cabal must choose -flag1 +flag2 for "pkg", which requires packages
+-- "flag1-false" and "flag2-true".
+dbBuildable1 :: ExampleDb
+dbBuildable1 = [
+    Right $ exAv "pkg" 1
+        [ ExAny "unknown"
+        , ExFlag "flag1" (Buildable []) NotBuildable
+        , ExFlag "flag2" (Buildable []) NotBuildable]
+     `withTests`
+        [ ExTest "optional-test"
+              [ ExAny "unknown"
+              , ExFlag "flag1"
+                    (Buildable [])
+                    (Buildable [ExFlag "flag2" NotBuildable (Buildable [])])]
+        , ExTest "test" [ exFlag "flag1" [ExAny "flag1-true"] [ExAny "flag1-false"]
+                        , exFlag "flag2" [ExAny "flag2-true"] [ExAny "flag2-false"]]
+        ]
+  , Right $ exAv "flag1-true" 1 []
+  , Right $ exAv "flag1-false" 1 []
+  , Right $ exAv "flag2-true" 1 []
+  , Right $ exAv "flag2-false" 1 []
+  ]
+
+-- | Package databases for testing @pkg-config@ dependencies.
+dbPC1 :: ExampleDb
+dbPC1 = [
+    Right $ exAv "A" 1 [ExPkg ("pkgA", 1)]
+  , Right $ exAv "B" 1 [ExPkg ("pkgB", 1), ExAny "A"]
+  , Right $ exAv "B" 2 [ExPkg ("pkgB", 2), ExAny "A"]
+  , Right $ exAv "C" 1 [ExAny "B"]
+  ]
+
+-- | cabal must pick B-2 to avoid the unknown dependency.
+dbBuildable2 :: ExampleDb
+dbBuildable2 = [
+    Right $ exAv "A" 1 [ExAny "B"]
+  , Right $ exAv "B" 1 [ExAny "unknown"]
+  , Right $ exAv "B" 2
+        [ ExAny "unknown"
+        , ExFlag "disable-lib" NotBuildable (Buildable [])
+        ]
+  , Right $ exAv "B" 3 [ExAny "unknown"]
+  ]

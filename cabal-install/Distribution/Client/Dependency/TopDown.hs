@@ -20,8 +20,9 @@ import qualified Distribution.Client.Dependency.TopDown.Constraints as Constrain
 import Distribution.Client.Dependency.TopDown.Constraints
          ( Satisfiable(..) )
 import Distribution.Client.Types
-         ( SourcePackage(..), ConfiguredPackage(..)
-         , enableStanzas, ConfiguredId(..), fakeInstalledPackageId )
+         ( SourcePackage(..), SolverPackage(..)
+         , UnresolvedPkgLoc, UnresolvedSourcePackage
+         , enableStanzas, SolverId(..) )
 import Distribution.Client.Dependency.Types
          ( DependencyResolver, ResolverPackage(..)
          , PackageConstraint(..), unlabelPackageConstraint
@@ -39,7 +40,7 @@ import Distribution.Client.PackageIndex
          ( PackageIndex )
 import Distribution.Package
          ( PackageName(..), PackageId, PackageIdentifier(..)
-         , InstalledPackageId(..)
+         , UnitId(..), ComponentId(..)
          , Package(..), packageVersion, packageName
          , Dependency(Dependency), thisPackageVersion, simplifyDependency )
 import Distribution.PackageDescription
@@ -127,8 +128,10 @@ explore pref (ChoiceNode _ choices)  =
       where
         isInstalled (SourceOnly _) = False
         isInstalled _              = True
-        isPreferred p = packageVersion p `withinRange` preferredVersions
-        (PackagePreferences preferredVersions packageInstalledPreference)
+        isPreferred p = length . filter (packageVersion p `withinRange`) $
+                        preferredVersions
+
+        (PackagePreferences preferredVersions packageInstalledPreference _)
           = pref pkgname
 
     logInfo node = Select selected discarded
@@ -248,8 +251,8 @@ search configure pref constraints =
 -- | The main exported resolver, with string logging and failure types to fit
 -- the standard 'DependencyResolver' interface.
 --
-topDownResolver :: DependencyResolver
-topDownResolver platform cinfo installedPkgIndex sourcePkgIndex
+topDownResolver :: DependencyResolver UnresolvedPkgLoc
+topDownResolver platform cinfo installedPkgIndex sourcePkgIndex _pkgConfigDB
                 preferences constraints targets =
     mapMessages $ topDownResolver'
                     platform cinfo
@@ -266,11 +269,11 @@ topDownResolver platform cinfo installedPkgIndex sourcePkgIndex
 --
 topDownResolver' :: Platform -> CompilerInfo
                  -> PackageIndex InstalledPackage
-                 -> PackageIndex SourcePackage
+                 -> PackageIndex UnresolvedSourcePackage
                  -> (PackageName -> PackagePreferences)
                  -> [PackageConstraint]
                  -> [PackageName]
-                 -> Progress Log Failure [ResolverPackage]
+                 -> Progress Log Failure [ResolverPackage UnresolvedPkgLoc]
 topDownResolver' platform cinfo installedPkgIndex sourcePkgIndex
                  preferences constraints targets =
       fmap (uncurry finalise)
@@ -298,7 +301,7 @@ topDownResolver' platform cinfo installedPkgIndex sourcePkgIndex
       . PackageIndex.fromList
       $ finaliseSelectedPackages preferences selected' constraints'
 
-    toResolverPackage :: FinalSelectedPackage -> ResolverPackage
+    toResolverPackage :: FinalSelectedPackage -> ResolverPackage UnresolvedPkgLoc
     toResolverPackage (SelectedInstalled (InstalledPackage pkg _))
                                               = PreExisting pkg
     toResolverPackage (SelectedSource    pkg) = Configured  pkg
@@ -444,7 +447,7 @@ annotateInstalledPackages dfsNumber installed = PackageIndex.fromList
 --
 annotateSourcePackages :: [PackageConstraint]
                        -> (PackageName -> TopologicalSortNumber)
-                       -> PackageIndex SourcePackage
+                       -> PackageIndex UnresolvedSourcePackage
                        -> PackageIndex UnconfiguredPackage
 annotateSourcePackages constraints dfsNumber sourcePkgIndex =
     PackageIndex.fromList
@@ -481,7 +484,7 @@ annotateSourcePackages constraints dfsNumber sourcePkgIndex =
 -- heuristic.
 --
 topologicalSortNumbering :: PackageIndex InstalledPackage
-                         -> PackageIndex SourcePackage
+                         -> PackageIndex UnresolvedSourcePackage
                          -> (PackageName -> TopologicalSortNumber)
 topologicalSortNumbering installedPkgIndex sourcePkgIndex =
     \pkgname -> let Just vertex = toVertex pkgname
@@ -508,17 +511,17 @@ topologicalSortNumbering installedPkgIndex sourcePkgIndex =
 -- and looking at the names of all possible dependencies.
 --
 selectNeededSubset :: PackageIndex InstalledPackage
-                   -> PackageIndex SourcePackage
+                   -> PackageIndex UnresolvedSourcePackage
                    -> Set PackageName
                    -> (PackageIndex InstalledPackage
-                      ,PackageIndex SourcePackage)
+                      ,PackageIndex UnresolvedSourcePackage)
 selectNeededSubset installedPkgIndex sourcePkgIndex = select mempty mempty
   where
     select :: PackageIndex InstalledPackage
-           -> PackageIndex SourcePackage
+           -> PackageIndex UnresolvedSourcePackage
            -> Set PackageName
            -> (PackageIndex InstalledPackage
-              ,PackageIndex SourcePackage)
+              ,PackageIndex UnresolvedSourcePackage)
     select installedPkgIndex' sourcePkgIndex' remaining
       | Set.null remaining = (installedPkgIndex', sourcePkgIndex')
       | otherwise = select installedPkgIndex'' sourcePkgIndex'' remaining''
@@ -567,9 +570,9 @@ convertInstalledPackageIndex index' = PackageIndex.fromList
     | (_,ipkg:_) <- InstalledPackageIndex.allPackagesBySourcePackageId index' ]
   where
     -- The InstalledPackageInfo only lists dependencies by the
-    -- InstalledPackageId, which means we do not directly know the corresponding
+    -- UnitId, which means we do not directly know the corresponding
     -- source dependency. The only way to find out is to lookup the
-    -- InstalledPackageId to get the InstalledPackageInfo and look at its
+    -- UnitId to get the InstalledPackageInfo and look at its
     -- source PackageId. But if the package is broken because it depends on
     -- other packages that do not exist then we have a problem we cannot find
     -- the original source package id. Instead we make up a bogus package id.
@@ -578,10 +581,10 @@ convertInstalledPackageIndex index' = PackageIndex.fromList
     sourceDepsOf index ipkg =
       [ maybe (brokenPackageId depid) packageId mdep
       | let depids = InstalledPackageInfo.depends ipkg
-            getpkg = InstalledPackageIndex.lookupInstalledPackageId index
+            getpkg = InstalledPackageIndex.lookupUnitId index
       , (depid, mdep) <- zip depids (map getpkg depids) ]
 
-    brokenPackageId (InstalledPackageId str) =
+    brokenPackageId (SimpleUnitId (ComponentId str)) =
       PackageIdentifier (PackageName (str ++ "-broken")) (Version [] [])
 
 -- ------------------------------------------------------------
@@ -609,43 +612,22 @@ finaliseSelectedPackages pref selected constraints =
 
     finaliseInstalled (InstalledPackageEx pkg _ _) = SelectedInstalled pkg
     finaliseSource mipkg (SemiConfiguredPackage pkg flags stanzas deps) =
-        SelectedSource (ConfiguredPackage pkg flags stanzas deps')
+        SelectedSource (SolverPackage pkg flags stanzas deps')
       where
         -- We cheat in the cabal solver, and classify all dependencies as
         -- library dependencies.
-        deps' :: ComponentDeps [ConfiguredId]
-        deps' = CD.fromLibraryDeps $ map (confId . pickRemaining mipkg) deps
+        deps' :: ComponentDeps [SolverId]
+        deps' = CD.fromLibraryDeps (unPackageName (packageName pkg))
+                                   (map (confId . pickRemaining mipkg) deps)
 
     -- InstalledOrSource indicates that we either have a source package
     -- available, or an installed one, or both. In the case that we have both
     -- available, we don't yet know if we can pick the installed one (the
     -- dependencies may not match up, for instance); this is verified in
-    -- `improvePlan`.
-    --
-    -- This means that at this point we cannot construct a valid installed
-    -- package ID yet for the dependencies. We therefore have two options:
-    --
-    -- * We could leave the installed package ID undefined here, and have a
-    --   separate pass over the output of the top-down solver, fixing all
-    --   dependencies so that if we depend on an already installed package we
-    --   use the proper installed package ID.
-    --
-    -- * We can _always_ use fake installed IDs, irrespective of whether we the
-    --   dependency is on an already installed package or not. This is okay
-    --   because (i) the top-down solver does not (and never will) support
-    --   multiple package instances, and (ii) we initialize the FakeMap with
-    --   fake IDs for already installed packages.
-    --
-    -- For now we use the second option; if however we change the implementation
-    -- of these fake IDs so that we do away with the FakeMap and update a
-    -- package reverse dependencies as we execute the install plan and discover
-    -- real package IDs, then this is no longer possible and we have to
-    -- implement the first option (see also Note [FakeMap] in Cabal).
-    confId :: InstalledOrSource InstalledPackageEx UnconfiguredPackage -> ConfiguredId
-    confId pkg = ConfiguredId {
-        confSrcId  = packageId pkg
-      , confInstId = fakeInstalledPackageId (packageId pkg)
-      }
+    -- `improvePlan`.  So we just set everything to be a planned ID for
+    -- now.
+    confId :: InstalledOrSource InstalledPackageEx UnconfiguredPackage -> SolverId
+    confId pkg = PlannedId (packageId pkg)
 
     pickRemaining mipkg dep@(Dependency _name versionRange) =
           case PackageIndex.lookupDependency remainingChoices dep of
@@ -669,9 +651,11 @@ finaliseSelectedPackages pref selected constraints =
         -- version constraints. TODO: distinguish hacks from prefs
         bounded = boundedAbove versionRange
         isPreferred p
-          | bounded   = True -- any constant will do
-          | otherwise = packageVersion p `withinRange` preferredVersions
-          where (PackagePreferences preferredVersions _) = pref (packageName p)
+          | bounded   = boundedRank -- this is a dummy constant
+          | otherwise = length . filter (packageVersion p `withinRange`) $
+                        preferredVersions
+          where (PackagePreferences preferredVersions _ _) = pref (packageName p)
+        boundedRank = 0 -- any value will do
 
         boundedAbove :: VersionRange -> Bool
         boundedAbove vr = case asVersionIntervals vr of

@@ -11,13 +11,16 @@ cabal-dev/
 cabal.config
 dist
 dist-*
+register.sh
 
 /Cabal/dist/
 /Cabal/tests/Setup
 /Cabal/Setup
+/Cabal/source-file-list
 
 /cabal-install/dist/
 /cabal-install/Setup
+/cabal-install/source-file-list
 
 
 # editor temp files
@@ -26,6 +29,7 @@ dist-*
 .#*
 *~
 .*.swp
+*.bak
 
 # GHC build
 
@@ -41,3 +45,11 @@ tags
 
 # stack artifacts
 /.stack-work/
+
+# Shake artifacts
+.shake*
+progress.txt
+
+# test files
+dist-test
+register.sh

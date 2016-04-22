@@ -1,4 +1,11 @@
-module Distribution.Client.Dependency.Modular.Assignment where
+module Distribution.Client.Dependency.Modular.Assignment
+    ( Assignment(..)
+    , FAssignment
+    , SAssignment
+    , PreAssignment(..)
+    , extend
+    , toCPs
+    ) where
 
 import Control.Applicative
 import Control.Monad
@@ -7,6 +14,8 @@ import Data.List as L
 import Data.Map as M
 import Data.Maybe
 import Prelude hiding (pi)
+
+import Language.Haskell.Extension (Extension, Language)
 
 import Distribution.PackageDescription (FlagAssignment) -- from Cabal
 import Distribution.Client.Types (OptionalStanza)
@@ -17,7 +26,6 @@ import qualified Distribution.Client.ComponentDeps as CD
 import Distribution.Client.Dependency.Modular.Configured
 import Distribution.Client.Dependency.Modular.Dependency
 import Distribution.Client.Dependency.Modular.Flag
-import Distribution.Client.Dependency.Modular.Index
 import Distribution.Client.Dependency.Modular.Package
 import Distribution.Client.Dependency.Modular.Version
 
@@ -53,14 +61,31 @@ data PreAssignment = PA PPreAssignment FAssignment SAssignment
 --
 -- Either returns a witness of the conflict that would arise during the merge,
 -- or the successfully extended assignment.
-extend :: Var QPN -> PPreAssignment -> [Dep QPN] -> Either (ConflictSet QPN, [Dep QPN]) PPreAssignment
-extend var pa qa = foldM (\ a (Dep qpn ci) ->
-                     let ci' = M.findWithDefault (Constrained []) qpn a
-                     in  case (\ x -> M.insert qpn x a) <$> merge ci' ci of
-                           Left (c, (d, d')) -> Left  (c, L.map (Dep qpn) (simplify (P qpn) d d'))
-                           Right x           -> Right x)
-                    pa qa
+extend :: (Extension -> Bool) -- ^ is a given extension supported
+       -> (Language  -> Bool) -- ^ is a given language supported
+       -> (PN -> VR  -> Bool) -- ^ is a given pkg-config requirement satisfiable
+       -> Goal QPN
+       -> PPreAssignment -> [Dep QPN] -> Either (ConflictSet QPN, [Dep QPN]) PPreAssignment
+extend extSupported langSupported pkgPresent goal@(Goal var _) = foldM extendSingle
   where
+
+    extendSingle :: PPreAssignment -> Dep QPN
+                 -> Either (ConflictSet QPN, [Dep QPN]) PPreAssignment
+    extendSingle a (Ext  ext )  =
+      if extSupported  ext  then Right a
+                            else Left (toConflictSet goal, [Ext ext])
+    extendSingle a (Lang lang)  =
+      if langSupported lang then Right a
+                            else Left (toConflictSet goal, [Lang lang])
+    extendSingle a (Pkg pn vr)  =
+      if pkgPresent pn vr then Right a
+                          else Left (toConflictSet goal, [Pkg pn vr])
+    extendSingle a (Dep qpn ci) =
+      let ci' = M.findWithDefault (Constrained []) qpn a
+      in  case (\ x -> M.insert qpn x a) <$> merge ci' ci of
+            Left (c, (d, d')) -> Left  (c, L.map (Dep qpn) (simplify (P qpn) d d'))
+            Right x           -> Right x
+
     -- We're trying to remove trivial elements of the conflict. If we're just
     -- making a choice pkg == instance, and pkg => pkg == instance is a part
     -- of the conflict, then this info is clear from the context and does not
@@ -123,37 +148,3 @@ toCPs (A pa fa sa) rdm =
                                  (M.findWithDefault [] qpn sapp)
                                  (depp' qpn))
           ps
-
--- | Finalize an assignment and a reverse dependency map.
---
--- This is preliminary, and geared towards output right now.
-finalize :: Index -> Assignment -> RevDepMap -> IO ()
-finalize idx (A pa fa _) rdm =
-  let
-    -- get hold of the graph
-    g  :: Graph Component
-    vm :: Vertex -> ((), QPN, [(Component, QPN)])
-    (g, vm) = graphFromEdges' (L.map (\ (x, xs) -> ((), x, xs)) (M.toList rdm))
-    -- topsort the dependency graph, yielding a list of pkgs in the right order
-    f :: [PI QPN]
-    f = L.filter (not . instPI) (L.map ((\ (_, x, _) -> PI x (pa M.! x)) . vm) (topSort g))
-    fapp :: Map QPN [(QFN, Bool)] -- flags per package
-    fapp = M.fromListWith (++) $
-           L.map (\ (qfn@(FN (PI qpn _) _), b) -> (qpn, [(qfn, b)])) $ M.toList $ fa
-    -- print one instance
-    ppi pi@(PI qpn _) = showPI pi ++ status pi ++ " " ++ pflags (M.findWithDefault [] qpn fapp)
-    -- print install status
-    status :: PI QPN -> String
-    status (PI (Q _ pn) _) =
-      case insts of
-        [] -> " (new)"
-        vs -> " (" ++ intercalate ", " (L.map showVer vs) ++ ")"
-      where insts = L.map (\ (I v _) -> v) $ L.filter isInstalled $
-                    M.keys (M.findWithDefault M.empty pn idx)
-            isInstalled (I _ (Inst _ )) = True
-            isInstalled _               = False
-    -- print flag assignment
-    pflags = unwords . L.map (uncurry showFBool)
-  in
-    -- show packages with associated flag assignments
-    putStr (unlines (L.map ppi f))

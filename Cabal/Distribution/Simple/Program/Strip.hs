@@ -10,16 +10,13 @@
 module Distribution.Simple.Program.Strip (stripLib, stripExe)
        where
 
-import Distribution.Simple.Program (ProgramConfiguration, lookupProgram
-                                   , programVersion, rawSystemProgram
-                                   , stripProgram)
-import Distribution.Simple.Utils   (warn)
-import Distribution.System         (Arch(..), Platform(..), OS (..), buildOS)
-import Distribution.Verbosity      (Verbosity)
-import Distribution.Version        (orLaterVersion, withinRange)
+import Distribution.Simple.Program
+import Distribution.Simple.Utils
+import Distribution.System
+import Distribution.Verbosity
+import Distribution.Version
 
 import Control.Monad               (unless)
-import Data.Version                (Version(..))
 import System.FilePath             (takeBaseName)
 
 runStrip :: Verbosity -> ProgramConfiguration -> FilePath -> [String] -> IO ()
@@ -47,10 +44,11 @@ stripExe verbosity (Platform _arch os) conf path =
 stripLib :: Verbosity -> Platform -> ProgramConfiguration -> FilePath -> IO ()
 stripLib verbosity (Platform arch os) conf path = do
   case os of
-    OSX -> -- '--strip-unneeded' is not supported on OS X, iOS or
+    OSX -> -- '--strip-unneeded' is not supported on OS X, iOS, AIX, or
            -- Solaris. See #1630.
            return ()
     IOS -> return ()
+    AIX -> return ()
     Solaris -> return ()
     Windows -> -- Stripping triggers a bug in 'strip.exe' for
                -- libraries with lots identically named modules. See

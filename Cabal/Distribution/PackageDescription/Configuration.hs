@@ -23,46 +23,38 @@ module Distribution.PackageDescription.Configuration (
     -- Utils
     parseCondition,
     freeVars,
+    extractCondition,
+    extractConditions,
+    addBuildableCondition,
     mapCondTree,
     mapTreeData,
     mapTreeConds,
     mapTreeConstrs,
+    transformAllBuildInfos,
+    transformAllBuildDepends,
   ) where
 
+import Control.Applicative -- 7.10 -Werror workaround.
+import Prelude
+
 import Distribution.Package
-         ( PackageName, Dependency(..) )
 import Distribution.PackageDescription
-         ( GenericPackageDescription(..), PackageDescription(..)
-         , Library(..), Executable(..), BuildInfo(..)
-         , Flag(..), FlagName(..), FlagAssignment
-         , Benchmark(..), CondTree(..), ConfVar(..), Condition(..)
-         , TestSuite(..) )
 import Distribution.PackageDescription.Utils
-         ( cabalBug, userBug )
 import Distribution.Version
-         ( VersionRange, anyVersion, intersectVersionRanges, withinRange )
 import Distribution.Compiler
-         ( CompilerId(CompilerId) )
 import Distribution.System
-         ( Platform(..), OS, Arch )
 import Distribution.Simple.Utils
-         ( currentDir, lowercase )
-import Distribution.Simple.Compiler
-         ( CompilerInfo(..) )
-
 import Distribution.Text
-         ( Text(parse) )
 import Distribution.Compat.ReadP as ReadP hiding ( char )
-import Control.Arrow (first)
 import qualified Distribution.Compat.ReadP as ReadP ( char )
+import Distribution.Compat.Semigroup as Semi
 
+import Control.Arrow (first)
 import Data.Char ( isAlphaNum )
-import Data.Maybe ( catMaybes, maybeToList )
+import Data.Maybe ( mapMaybe, maybeToList )
 import Data.Map ( Map, fromListWith, toList )
 import qualified Data.Map as Map
-#if __GLASGOW_HASKELL__ < 710
-import Data.Monoid
-#endif
+import Data.Tree ( Tree(Node) )
 
 ------------------------------------------------------------------------------
 
@@ -185,14 +177,14 @@ mapTreeData f = mapCondTree f id id
 --   clarity.
 data DepTestRslt d = DepOk | MissingDeps d
 
-instance Monoid d => Monoid (DepTestRslt d) where
+instance Semigroup d => Monoid (DepTestRslt d) where
     mempty = DepOk
-    mappend DepOk x = x
-    mappend x DepOk = x
-    mappend (MissingDeps d) (MissingDeps d') = MissingDeps (d `mappend` d')
+    mappend = (Semi.<>)
 
-
-data BT a = BTN a | BTB (BT a) (BT a)  -- very simple binary tree
+instance Semigroup d => Semigroup (DepTestRslt d) where
+    DepOk <> x     = x
+    x     <> DepOk = x
+    (MissingDeps d) <> (MissingDeps d') = MissingDeps (d <> d')
 
 
 -- | Try to find a flag assignment that satisfies the constraints of all trees.
@@ -201,8 +193,9 @@ data BT a = BTN a | BTB (BT a) (BT a)  -- very simple binary tree
 -- resulting data, the associated dependencies, and the chosen flag
 -- assignments.
 --
--- In case of failure, the _smallest_ number of of missing dependencies is
--- returned. [TODO: Could also be specified with a function argument.]
+-- In case of failure, the union of the dependencies that led to backtracking
+-- on all branches is returned.
+-- [TODO: Could also be specified with a function argument.]
 --
 -- TODO: The current algorithm is rather naive.  A better approach would be to:
 --
@@ -228,64 +221,137 @@ resolveWithFlags ::
        -- ^ Either the missing dependencies (error case), or a pair of
        -- (set of build targets with dependencies, chosen flag assignments)
 resolveWithFlags dom os arch impl constrs trees checkDeps =
-    case try dom [] of
-      Right r -> Right r
-      Left dbt -> Left $ findShortest dbt
+    either (Left . fromDepMapUnion) Right $ explore (build [] dom)
   where
     extraConstrs = toDepMap constrs
 
     -- simplify trees by (partially) evaluating all conditions and converting
     -- dependencies to dependency maps.
+    simplifiedTrees :: [CondTree FlagName DependencyMap PDTagged]
     simplifiedTrees = map ( mapTreeConstrs toDepMap  -- convert to maps
+                          . addBuildableCondition pdTaggedBuildInfo
                           . mapTreeConds (fst . simplifyWithSysParams os arch impl))
                           trees
 
-    -- @try@ recursively tries all possible flag assignments in the domain and
-    -- either succeeds or returns a binary tree with the missing dependencies
-    -- encountered in each run.  Since the tree is constructed lazily, we
-    -- avoid some computation overhead in the successful case.
-    try [] flags =
+    -- @explore@ searches a tree of assignments, backtracking whenever a flag
+    -- introduces a dependency that cannot be satisfied.  If there is no
+    -- solution, @explore@ returns the union of all dependencies that caused
+    -- it to backtrack.  Since the tree is constructed lazily, we avoid some
+    -- computation overhead in the successful case.
+    explore :: Tree FlagAssignment
+            -> Either DepMapUnion (TargetSet PDTagged, FlagAssignment)
+    explore (Node flags ts) =
         let targetSet = TargetSet $ flip map simplifiedTrees $
                 -- apply additional constraints to all dependencies
                 first (`constrainBy` extraConstrs) .
                 simplifyCondTree (env flags)
             deps = overallDependencies targetSet
         in case checkDeps (fromDepMap deps) of
-             DepOk           -> Right (targetSet, flags)
-             MissingDeps mds -> Left (BTN mds)
+             DepOk | null ts   -> Right (targetSet, flags)
+                   | otherwise -> tryAll $ map explore ts
+             MissingDeps mds   -> Left (toDepMapUnion mds)
 
-    try ((n, vals):rest) flags =
-        tryAll $ map (\v -> try rest ((n, v):flags)) vals
+    -- Builds a tree of all possible flag assignments.  Internal nodes
+    -- have only partial assignments.
+    build :: FlagAssignment -> [(FlagName, [Bool])] -> Tree FlagAssignment
+    build assigned [] = Node assigned []
+    build assigned ((fn, vals) : unassigned) =
+        Node assigned $ map (\v -> build ((fn, v) : assigned) unassigned) vals
 
+    tryAll :: [Either DepMapUnion a] -> Either DepMapUnion a
     tryAll = foldr mp mz
 
     -- special version of `mplus' for our local purposes
-    mp (Left xs)   (Left ys)   = (Left (BTB xs ys))
-    mp (Left _)    m@(Right _) = m
+    mp :: Either DepMapUnion a -> Either DepMapUnion a -> Either DepMapUnion a
     mp m@(Right _) _           = m
+    mp _           m@(Right _) = m
+    mp (Left xs)   (Left ys)   =
+        let union = Map.foldrWithKey (Map.insertWith' combine)
+                    (unDepMapUnion xs) (unDepMapUnion ys)
+            combine x y = simplifyVersionRange $ unionVersionRanges x y
+        in union `seq` Left (DepMapUnion union)
 
     -- `mzero'
-    mz = Left (BTN [])
+    mz :: Either DepMapUnion a
+    mz = Left (DepMapUnion Map.empty)
 
+    env :: FlagAssignment -> FlagName -> Either FlagName Bool
     env flags flag = (maybe (Left flag) Right . lookup flag) flags
 
-    -- for the error case we inspect our lazy tree of missing dependencies and
-    -- pick the shortest list of missing dependencies
-    findShortest (BTN x) = x
-    findShortest (BTB lt rt) =
-        let l = findShortest lt
-            r = findShortest rt
-        in case (l,r) of
-             ([], xs) -> xs  -- [] is too short
-             (xs, []) -> xs
-             ([x], _) -> [x] -- single elem is optimum
-             (_, [x]) -> [x]
-             (xs, ys) -> if lazyLengthCmp xs ys
-                         then xs else ys
-    -- lazy variant of @\xs ys -> length xs <= length ys@
-    lazyLengthCmp [] _ = True
-    lazyLengthCmp _ [] = False
-    lazyLengthCmp (_:xs) (_:ys) = lazyLengthCmp xs ys
+    pdTaggedBuildInfo :: PDTagged -> BuildInfo
+    pdTaggedBuildInfo (Lib _ l) = libBuildInfo l
+    pdTaggedBuildInfo (Exe _ e) = buildInfo e
+    pdTaggedBuildInfo (Test _ t) = testBuildInfo t
+    pdTaggedBuildInfo (Bench _ b) = benchmarkBuildInfo b
+    pdTaggedBuildInfo PDNull = mempty
+
+-- | Transforms a 'CondTree' by putting the input under the "then" branch of a
+-- conditional that is True when Buildable is True. If 'addBuildableCondition'
+-- can determine that Buildable is always True, it returns the input unchanged.
+-- If Buildable is always False, it returns the empty 'CondTree'.
+addBuildableCondition :: (Eq v, Monoid a, Monoid c) => (a -> BuildInfo)
+                      -> CondTree v c a
+                      -> CondTree v c a
+addBuildableCondition getInfo t =
+  case extractCondition (buildable . getInfo) t of
+    Lit True  -> t
+    Lit False -> CondNode mempty mempty []
+    c         -> CondNode mempty mempty [(c, t, Nothing)]
+
+-- Note: extracting buildable conditions.
+-- --------------------------------------
+--
+-- If the conditions in a cond tree lead to Buildable being set to False, then
+-- none of the dependencies for this cond tree should actually be taken into
+-- account. On the other hand, some of the flags may only be decided in the
+-- solver, so we cannot necessarily make the decision whether a component is
+-- Buildable or not prior to solving.
+--
+-- What we are doing here is to partially evaluate a condition tree in order to
+-- extract the condition under which Buildable is True. The predicate determines
+-- whether data under a 'CondTree' is buildable.
+
+
+-- | Extract the condition matched by the given predicate from a cond tree.
+--
+-- We use this mainly for extracting buildable conditions (see the Note above),
+-- but the function is in fact more general.
+extractCondition :: Eq v => (a -> Bool) -> CondTree v c a -> Condition v
+extractCondition p = go
+  where
+    go (CondNode x _ cs) | not (p x) = Lit False
+                         | otherwise = goList cs
+
+    goList []               = Lit True
+    goList ((c, t, e) : cs) =
+      let
+        ct = go t
+        ce = maybe (Lit True) go e
+      in
+        ((c `cAnd` ct) `cOr` (CNot c `cAnd` ce)) `cAnd` goList cs
+
+-- | Extract conditions matched by the given predicate from all cond trees in a
+-- 'GenericPackageDescription'.
+extractConditions :: (BuildInfo -> Bool) -> GenericPackageDescription
+                     -> [Condition ConfVar]
+extractConditions f gpkg =
+  concat [
+      extractCondition (f . libBuildInfo)       . snd <$> condLibraries   gpkg
+    , extractCondition (f . buildInfo)          . snd <$> condExecutables gpkg
+    , extractCondition (f . testBuildInfo)      . snd <$> condTestSuites  gpkg
+    , extractCondition (f . benchmarkBuildInfo) . snd <$> condBenchmarks  gpkg
+    ]
+
+
+-- | A map of dependencies that combines version ranges using 'unionVersionRanges'.
+newtype DepMapUnion = DepMapUnion { unDepMapUnion :: Map PackageName VersionRange }
+
+toDepMapUnion :: [Dependency] -> DepMapUnion
+toDepMapUnion ds =
+  DepMapUnion $ fromListWith unionVersionRanges [ (p,vr) | Dependency p vr <- ds ]
+
+fromDepMapUnion :: DepMapUnion -> [Dependency]
+fromDepMapUnion m = [ Dependency p vr | (p,vr) <- toList (unDepMapUnion m) ]
 
 -- | A map of dependencies.  Newtyped since the default monoid instance is not
 --   appropriate.  The monoid instance uses 'intersectVersionRanges'.
@@ -294,7 +360,10 @@ newtype DependencyMap = DependencyMap { unDependencyMap :: Map PackageName Versi
 
 instance Monoid DependencyMap where
     mempty = DependencyMap Map.empty
-    (DependencyMap a) `mappend` (DependencyMap b) =
+    mappend = (Semi.<>)
+
+instance Semigroup DependencyMap where
+    (DependencyMap a) <> (DependencyMap b) =
         DependencyMap (Map.unionWith intersectVersionRanges a b)
 
 toDepMap :: [Dependency] -> DependencyMap
@@ -304,18 +373,20 @@ toDepMap ds =
 fromDepMap :: DependencyMap -> [Dependency]
 fromDepMap m = [ Dependency p vr | (p,vr) <- toList (unDependencyMap m) ]
 
+-- | Flattens a CondTree using a partial flag assignment.  When a condition
+-- cannot be evaluated, both branches are ignored.
 simplifyCondTree :: (Monoid a, Monoid d) =>
                     (v -> Either v Bool)
                  -> CondTree v d a
                  -> (d, a)
 simplifyCondTree env (CondNode a d ifs) =
-    mconcat $ (d, a) : catMaybes (map simplifyIf ifs)
+    mconcat $ (d, a) : mapMaybe simplifyIf ifs
   where
     simplifyIf (cnd, t, me) =
         case simplifyCondition cnd env of
           (Lit True, _) -> Just $ simplifyCondTree env t
           (Lit False, _) -> fmap (simplifyCondTree env) me
-          _ -> error $ "Environment not defined for all free vars"
+          _ -> Nothing
 
 -- | Flatten a CondTree.  This will resolve the CondTree by taking all
 --  possible paths into account.  Note that since branches represent exclusive
@@ -350,11 +421,11 @@ overallDependencies (TargetSet targets) = mconcat depss
   where
     (depss, _) = unzip $ filter (removeDisabledSections . snd) targets
     removeDisabledSections :: PDTagged -> Bool
-    removeDisabledSections (Lib _) = True
-    removeDisabledSections (Exe _ _) = True
-    removeDisabledSections (Test _ t) = testEnabled t
-    removeDisabledSections (Bench _ b) = benchmarkEnabled b
-    removeDisabledSections PDNull = True
+    removeDisabledSections (Lib _ l)     = buildable (libBuildInfo l)
+    removeDisabledSections (Exe _ e)   = buildable (buildInfo e)
+    removeDisabledSections (Test _ t)  = testEnabled t && buildable (testBuildInfo t)
+    removeDisabledSections (Bench _ b) = benchmarkEnabled b && buildable (benchmarkBuildInfo b)
+    removeDisabledSections PDNull      = True
 
 -- Apply extra constraints to a dependency map.
 -- Combines dependencies where the result will only contain keys from the left
@@ -375,50 +446,53 @@ constrainBy left extra =
 -- | Collect up the targets in a TargetSet of tagged targets, storing the
 -- dependencies as we go.
 flattenTaggedTargets :: TargetSet PDTagged ->
-        (Maybe Library, [(String, Executable)], [(String, TestSuite)]
+        ([(String, Library)], [(String, Executable)], [(String, TestSuite)]
         , [(String, Benchmark)])
-flattenTaggedTargets (TargetSet targets) = foldr untag (Nothing, [], [], []) targets
+flattenTaggedTargets (TargetSet targets) = foldr untag ([], [], [], []) targets
   where
-    untag (_, Lib _) (Just _, _, _, _) = userBug "Only one library expected"
-    untag (deps, Lib l) (Nothing, exes, tests, bms) =
-        (Just l', exes, tests, bms)
+    untag (deps, Lib n l) (libs, exes, tests, bms)
+        | any ((== n) . fst) libs =
+          userBug $ "There exist several libs with the same name: '" ++ n ++ "'"
+        -- NB: libraries live in a different namespace than everything else
+        -- TODO: no, (new-style) TESTS live in same namespace!!
+        | otherwise = ((n, l'):libs, exes, tests, bms)
       where
         l' = l {
                 libBuildInfo = (libBuildInfo l) { targetBuildDepends = fromDepMap deps }
             }
-    untag (deps, Exe n e) (mlib, exes, tests, bms)
+    untag (deps, Exe n e) (libs, exes, tests, bms)
         | any ((== n) . fst) exes =
           userBug $ "There exist several exes with the same name: '" ++ n ++ "'"
         | any ((== n) . fst) tests =
           userBug $ "There exists a test with the same name as an exe: '" ++ n ++ "'"
         | any ((== n) . fst) bms =
           userBug $ "There exists a benchmark with the same name as an exe: '" ++ n ++ "'"
-        | otherwise = (mlib, (n, e'):exes, tests, bms)
+        | otherwise = (libs, (n, e'):exes, tests, bms)
       where
         e' = e {
                 buildInfo = (buildInfo e) { targetBuildDepends = fromDepMap deps }
             }
-    untag (deps, Test n t) (mlib, exes, tests, bms)
+    untag (deps, Test n t) (libs, exes, tests, bms)
         | any ((== n) . fst) tests =
           userBug $ "There exist several tests with the same name: '" ++ n ++ "'"
         | any ((== n) . fst) exes =
           userBug $ "There exists an exe with the same name as the test: '" ++ n ++ "'"
         | any ((== n) . fst) bms =
           userBug $ "There exists a benchmark with the same name as the test: '" ++ n ++ "'"
-        | otherwise = (mlib, exes, (n, t'):tests, bms)
+        | otherwise = (libs, exes, (n, t'):tests, bms)
       where
         t' = t {
             testBuildInfo = (testBuildInfo t)
                 { targetBuildDepends = fromDepMap deps }
             }
-    untag (deps, Bench n b) (mlib, exes, tests, bms)
+    untag (deps, Bench n b) (libs, exes, tests, bms)
         | any ((== n) . fst) bms =
           userBug $ "There exist several benchmarks with the same name: '" ++ n ++ "'"
         | any ((== n) . fst) exes =
           userBug $ "There exists an exe with the same name as the benchmark: '" ++ n ++ "'"
         | any ((== n) . fst) tests =
           userBug $ "There exists a test with the same name as the benchmark: '" ++ n ++ "'"
-        | otherwise = (mlib, exes, tests, (n, b'):bms)
+        | otherwise = (libs, exes, tests, (n, b'):bms)
       where
         b' = b {
             benchmarkBuildInfo = (benchmarkBuildInfo b)
@@ -431,7 +505,7 @@ flattenTaggedTargets (TargetSet targets) = foldr untag (Nothing, [], [], []) tar
 -- Convert GenericPackageDescription to PackageDescription
 --
 
-data PDTagged = Lib Library
+data PDTagged = Lib String Library
               | Exe String Executable
               | Test String TestSuite
               | Bench String Benchmark
@@ -440,13 +514,16 @@ data PDTagged = Lib Library
 
 instance Monoid PDTagged where
     mempty = PDNull
-    PDNull `mappend` x = x
-    x `mappend` PDNull = x
-    Lib l `mappend` Lib l' = Lib (l `mappend` l')
-    Exe n e `mappend` Exe n' e' | n == n' = Exe n (e `mappend` e')
-    Test n t `mappend` Test n' t' | n == n' = Test n (t `mappend` t')
-    Bench n b `mappend` Bench n' b' | n == n' = Bench n (b `mappend` b')
-    _ `mappend` _ = cabalBug "Cannot combine incompatible tags"
+    mappend = (Semi.<>)
+
+instance Semigroup PDTagged where
+    PDNull    <> x      = x
+    x         <> PDNull = x
+    Lib n l   <> Lib   n' l' | n == n' = Lib n (l <> l')
+    Exe n e   <> Exe   n' e' | n == n' = Exe n (e <> e')
+    Test n t  <> Test  n' t' | n == n' = Test n (t <> t')
+    Bench n b <> Bench n' b' | n == n' = Bench n (b <> b')
+    _         <> _  = cabalBug "Cannot combine incompatible tags"
 
 -- | Create a package description with all configurations resolved.
 --
@@ -465,9 +542,10 @@ instance Monoid PDTagged where
 --
 -- This function will fail if it cannot find a flag assignment that leads to
 -- satisfiable dependencies.  (It will not try alternative assignments for
--- explicitly specified flags.)  In case of failure it will return a /minimum/
--- number of dependencies that could not be satisfied.  On success, it will
--- return the package description and the full flag assignment chosen.
+-- explicitly specified flags.)  In case of failure it will return the missing
+-- dependencies that it encountered when trying different flag assignments.
+-- On success, it will return the package description and the full flag
+-- assignment chosen.
 --
 finalizePackageDescription ::
      FlagAssignment  -- ^ Explicitly specified flag assignments
@@ -484,25 +562,21 @@ finalizePackageDescription ::
              -- description along with the flag assignments chosen.
 finalizePackageDescription userflags satisfyDep
         (Platform arch os) impl constraints
-        (GenericPackageDescription pkg flags mlib0 exes0 tests0 bms0) =
+        (GenericPackageDescription pkg flags libs0 exes0 tests0 bms0) =
     case resolveFlags of
-      Right ((mlib, exes', tests', bms'), targetSet, flagVals) ->
-        Right ( pkg { library = mlib
+      Right ((libs', exes', tests', bms'), targetSet, flagVals) ->
+        Right ( pkg { libraries = libs'
                     , executables = exes'
                     , testSuites = tests'
                     , benchmarks = bms'
                     , buildDepends = fromDepMap (overallDependencies targetSet)
-                      --TODO: we need to find a way to avoid pulling in deps
-                      -- for non-buildable components. However cannot simply
-                      -- filter at this stage, since if the package were not
-                      -- available we would have failed already.
                     }
               , flagVals )
 
       Left missing -> Left missing
   where
     -- Combine lib, exes, and tests into one list of @CondTree@s with tagged data
-    condTrees = maybeToList (fmap (mapTreeData Lib) mlib0 )
+    condTrees =    map (\(name,tree) -> mapTreeData (Lib name) tree) libs0
                 ++ map (\(name,tree) -> mapTreeData (Exe name) tree) exes0
                 ++ map (\(name,tree) -> mapTreeData (Test name) tree) tests0
                 ++ map (\(name,tree) -> mapTreeData (Bench name) tree) bms0
@@ -510,8 +584,8 @@ finalizePackageDescription userflags satisfyDep
     resolveFlags =
         case resolveWithFlags flagChoices os arch impl constraints condTrees check of
           Right (targetSet, fs) ->
-              let (mlib, exes, tests, bms) = flattenTaggedTargets targetSet in
-              Right ( (fmap libFillInDefaults mlib,
+              let (libs, exes, tests, bms) = flattenTaggedTargets targetSet in
+              Right ( (map (\(n,l) -> (libFillInDefaults l) { libName = n }) libs,
                        map (\(n,e) -> (exeFillInDefaults e) { exeName = n }) exes,
                        map (\(n,t) -> (testFillInDefaults t) { testName = n }) tests,
                        map (\(n,b) -> (benchFillInDefaults b) { benchmarkName = n }) bms),
@@ -554,21 +628,21 @@ resolveWithFlags [] Distribution.System.Linux Distribution.System.I386 (Distribu
 -- default path will be missing from the package description returned by this
 -- function.
 flattenPackageDescription :: GenericPackageDescription -> PackageDescription
-flattenPackageDescription (GenericPackageDescription pkg _ mlib0 exes0 tests0 bms0) =
-    pkg { library = mlib
+flattenPackageDescription (GenericPackageDescription pkg _ libs0 exes0 tests0 bms0) =
+    pkg { libraries = reverse libs
         , executables = reverse exes
         , testSuites = reverse tests
         , benchmarks = reverse bms
-        , buildDepends = ldeps ++ reverse edeps ++ reverse tdeps ++ reverse bdeps
+        , buildDepends = reverse ldeps ++ reverse edeps ++ reverse tdeps ++ reverse bdeps
         }
   where
-    (mlib, ldeps) = case mlib0 of
-        Just lib -> let (l,ds) = ignoreConditions lib in
-                    (Just (libFillInDefaults l), ds)
-        Nothing -> (Nothing, [])
+    (libs, ldeps) = foldr flattenLib ([],[]) libs0
     (exes, edeps) = foldr flattenExe ([],[]) exes0
     (tests, tdeps) = foldr flattenTst ([],[]) tests0
     (bms, bdeps) = foldr flattenBm ([],[]) bms0
+    flattenLib (n, t) (es, ds) =
+        let (e, ds') = ignoreConditions t in
+        ( (libFillInDefaults $ e { libName = n }) : es, ds' ++ ds )
     flattenExe (n, t) (es, ds) =
         let (e, ds') = ignoreConditions t in
         ( (exeFillInDefaults $ e { exeName = n }) : es, ds' ++ ds )
@@ -607,3 +681,82 @@ biFillInDefaults bi =
     if null (hsSourceDirs bi)
     then bi { hsSourceDirs = [currentDir] }
     else bi
+
+-- Walk a 'GenericPackageDescription' and apply @onBuildInfo@/@onSetupBuildInfo@
+-- to all nested 'BuildInfo'/'SetupBuildInfo' values.
+transformAllBuildInfos :: (BuildInfo -> BuildInfo)
+                       -> (SetupBuildInfo -> SetupBuildInfo)
+                       -> GenericPackageDescription
+                       -> GenericPackageDescription
+transformAllBuildInfos onBuildInfo onSetupBuildInfo gpd = gpd'
+  where
+    onLibrary    lib  = lib { libBuildInfo  = onBuildInfo $ libBuildInfo  lib }
+    onExecutable exe  = exe { buildInfo     = onBuildInfo $ buildInfo     exe }
+    onTestSuite  tst  = tst { testBuildInfo = onBuildInfo $ testBuildInfo tst }
+    onBenchmark  bmk  = bmk { benchmarkBuildInfo =
+                                 onBuildInfo $ benchmarkBuildInfo bmk }
+
+    pd = packageDescription gpd
+    pd'  = pd {
+      libraries      = map  onLibrary        (libraries pd),
+      executables    = map  onExecutable     (executables pd),
+      testSuites     = map  onTestSuite      (testSuites pd),
+      benchmarks     = map  onBenchmark      (benchmarks pd),
+      setupBuildInfo = fmap onSetupBuildInfo (setupBuildInfo pd)
+      }
+
+    gpd' = transformAllCondTrees onLibrary onExecutable
+           onTestSuite onBenchmark id
+           $ gpd { packageDescription = pd' }
+
+-- | Walk a 'GenericPackageDescription' and apply @f@ to all nested
+-- @build-depends@ fields.
+transformAllBuildDepends :: (Dependency -> Dependency)
+                         -> GenericPackageDescription
+                         -> GenericPackageDescription
+transformAllBuildDepends f gpd = gpd'
+  where
+    onBI  bi  = bi  { targetBuildDepends = map f $ targetBuildDepends bi }
+    onSBI stp = stp { setupDepends       = map f $ setupDepends stp      }
+    onPD  pd  = pd  { buildDepends       = map f $ buildDepends pd       }
+
+    pd'   = onPD $ packageDescription gpd
+    gpd'  = transformAllCondTrees id id id id (map f)
+            . transformAllBuildInfos onBI onSBI
+            $ gpd { packageDescription = pd' }
+
+-- | Walk all 'CondTree's inside a 'GenericPackageDescription' and apply
+-- appropriate transformations to all nodes. Helper function used by
+-- 'transformAllBuildDepends' and 'transformAllBuildInfos'.
+transformAllCondTrees :: (Library -> Library)
+                      -> (Executable -> Executable)
+                      -> (TestSuite -> TestSuite)
+                      -> (Benchmark -> Benchmark)
+                      -> ([Dependency] -> [Dependency])
+                      -> GenericPackageDescription -> GenericPackageDescription
+transformAllCondTrees onLibrary onExecutable
+  onTestSuite onBenchmark onDepends gpd = gpd'
+  where
+    gpd'    = gpd {
+      condLibraries      = condLibs',
+      condExecutables    = condExes',
+      condTestSuites     = condTests',
+      condBenchmarks     = condBenchs'
+      }
+
+    condLibs   = condLibraries      gpd
+    condExes   = condExecutables    gpd
+    condTests  = condTestSuites     gpd
+    condBenchs = condBenchmarks     gpd
+
+    condLibs'   = map  (mapSnd $ onCondTree onLibrary)    condLibs
+    condExes'   = map  (mapSnd $ onCondTree onExecutable) condExes
+    condTests'  = map  (mapSnd $ onCondTree onTestSuite)  condTests
+    condBenchs' = map  (mapSnd $ onCondTree onBenchmark)  condBenchs
+
+    mapSnd :: (a -> b) -> (c,a) -> (c,b)
+    mapSnd = fmap
+
+    onCondTree :: (a -> b) -> CondTree v [Dependency] a
+               -> CondTree v [Dependency] b
+    onCondTree g = mapCondTree g onDepends id

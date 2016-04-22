@@ -31,21 +31,16 @@ module Distribution.Simple.BuildPaths (
   ) where
 
 
-import System.FilePath ((</>), (<.>))
-
 import Distribution.Package
-         ( packageName, LibraryName, getHSLibraryName )
-import Distribution.ModuleName (ModuleName)
-import qualified Distribution.ModuleName as ModuleName
+import Distribution.ModuleName as ModuleName
 import Distribution.Compiler
-         ( CompilerId(..) )
-import Distribution.PackageDescription (PackageDescription)
+import Distribution.PackageDescription
 import Distribution.Simple.LocalBuildInfo
-         ( LocalBuildInfo(buildDir) )
-import Distribution.Simple.Setup (defaultDistPref)
+import Distribution.Simple.Setup
 import Distribution.Text
-         ( display )
-import Distribution.System (OS(..), buildOS)
+import Distribution.System
+
+import System.FilePath ((</>), (<.>))
 
 -- ---------------------------------------------------------------------------
 -- Build directories and files
@@ -61,8 +56,10 @@ haddockPref distPref pkg_descr
     = distPref </> "doc" </> "html" </> display (packageName pkg_descr)
 
 -- |The directory in which we put auto-generated modules
-autogenModulesDir :: LocalBuildInfo -> String
-autogenModulesDir lbi = buildDir lbi </> "autogen"
+autogenModulesDir :: LocalBuildInfo -> ComponentLocalBuildInfo -> String
+autogenModulesDir lbi clbi = componentBuildDir lbi clbi </> "autogen"
+-- NB: Look at 'checkForeignDeps' for where a simplified version of this
+-- has been copy-pasted.
 
 cppHeaderName :: String
 cppHeaderName = "cabal_macros.h"
@@ -81,16 +78,16 @@ haddockName pkg_descr = display (packageName pkg_descr) <.> "haddock"
 -- ---------------------------------------------------------------------------
 -- Library file names
 
-mkLibName :: LibraryName -> String
+mkLibName :: UnitId -> String
 mkLibName lib = "lib" ++ getHSLibraryName lib <.> "a"
 
-mkProfLibName :: LibraryName -> String
+mkProfLibName :: UnitId -> String
 mkProfLibName lib =  "lib" ++ getHSLibraryName lib ++ "_p" <.> "a"
 
 -- Implement proper name mangling for dynamical shared objects
 -- libHS<packagename>-<compilerFlavour><compilerVersion>
 -- e.g. libHSbase-2.1-ghc6.6.1.so
-mkSharedLibName :: CompilerId -> LibraryName -> String
+mkSharedLibName :: CompilerId -> UnitId -> String
 mkSharedLibName (CompilerId compilerFlavor compilerVersion) lib
   = "lib" ++ getHSLibraryName lib ++ "-" ++ comp <.> dllExtension
   where comp = display compilerFlavor ++ display compilerVersion
@@ -99,15 +96,13 @@ mkSharedLibName (CompilerId compilerFlavor compilerVersion) lib
 -- * Platform file extensions
 -- ------------------------------------------------------------
 
--- ToDo: This should be determined via autoconf (AC_EXEEXT)
--- | Extension for executable files
+-- | Default extension for executable files on the current platform.
 -- (typically @\"\"@ on Unix and @\"exe\"@ on Windows or OS\/2)
 exeExtension :: String
 exeExtension = case buildOS of
                    Windows -> "exe"
                    _       -> ""
 
--- TODO: This should be determined via autoconf (AC_OBJEXT)
 -- | Extension for object files. For GHC the extension is @\"o\"@.
 objExtension :: String
 objExtension = "o"

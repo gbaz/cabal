@@ -3,10 +3,13 @@
 module Distribution.Client.Utils ( MergeResult(..)
                                  , mergeBy, duplicates, duplicatesBy
                                  , readMaybe
-                                 , inDir, determineNumJobs, numberOfProcessors
+                                 , inDir, logDirChange
+                                 , determineNumJobs, numberOfProcessors
                                  , removeExistingFile
                                  , withTempFileName
-                                 , makeAbsoluteToCwd, filePathToByteString
+                                 , makeAbsoluteToCwd
+                                 , makeRelativeToCwd, makeRelativeToDir
+                                 , filePathToByteString
                                  , byteStringToFilePath, tryCanonicalizePath
                                  , canonicalizePathNoThrow
                                  , moreRecentFile, existsAndIsMoreRecentThan
@@ -16,10 +19,13 @@ module Distribution.Client.Utils ( MergeResult(..)
        where
 
 import Distribution.Compat.Exception   ( catchIO )
-import Distribution.Client.Compat.Time ( getModTime )
+import Distribution.Compat.Time ( getModTime )
 import Distribution.Simple.Setup       ( Flag(..) )
 import Distribution.Simple.Utils       ( die, findPackageDesc )
 import qualified Data.ByteString.Lazy as BS
+#if !MIN_VERSION_base(4,8,0)
+import Control.Applicative
+#endif
 import Control.Monad
          ( when )
 import Data.Bits
@@ -41,7 +47,7 @@ import System.Directory
          ( canonicalizePath, doesFileExist, getCurrentDirectory
          , removeFile, setCurrentDirectory )
 import System.FilePath
-         ( (</>), isAbsolute )
+         ( (</>), isAbsolute, takeDrive, splitPath, joinPath )
 import System.IO
          ( Handle, hClose, openTempFile
 #if MIN_VERSION_base(4,4,0)
@@ -57,7 +63,7 @@ import GHC.IO.Encoding.Failure
          ( recoverEncode, CodingFailureMode(TransliterateCodingFailure) )
 #endif
 
-#if defined(mingw32_HOST_OS)
+#if defined(mingw32_HOST_OS) || MIN_VERSION_directory(1,2,3)
 import Prelude hiding (ioError)
 import Control.Monad (liftM2, unless)
 import System.Directory (doesDirectoryExist)
@@ -123,12 +129,23 @@ withTempFileName tmpDir template action =
     (\(name, h) -> hClose h >> action name)
 
 -- | Executes the action in the specified directory.
+--
+-- Warning: This operation is NOT thread-safe, because current
+-- working directory is a process-global concept.
 inDir :: Maybe FilePath -> IO a -> IO a
 inDir Nothing m = m
 inDir (Just d) m = do
   old <- getCurrentDirectory
   setCurrentDirectory d
   m `Exception.finally` setCurrentDirectory old
+
+-- | Log directory change in 'make' compatible syntax
+logDirChange :: (String -> IO ()) -> Maybe FilePath -> IO a -> IO a
+logDirChange _ Nothing m = m
+logDirChange l (Just d) m = do
+  l $ "cabal: Entering directory '" ++ d ++ "'\n"
+  m `Exception.finally`
+    (l $ "cabal: Leaving directory '" ++ d ++ "'\n")
 
 foreign import ccall "getNumberOfProcessors" c_getNumberOfProcessors :: IO CInt
 
@@ -151,6 +168,30 @@ makeAbsoluteToCwd :: FilePath -> IO FilePath
 makeAbsoluteToCwd path | isAbsolute path = return path
                        | otherwise       = do cwd <- getCurrentDirectory
                                               return $! cwd </> path
+
+-- | Given a path (relative or absolute), make it relative to the current
+-- directory, including using @../..@ if necessary.
+makeRelativeToCwd :: FilePath -> IO FilePath
+makeRelativeToCwd path =
+    makeRelativeCanonical <$> canonicalizePath path <*> getCurrentDirectory
+
+-- | Given a path (relative or absolute), make it relative to the given
+-- directory, including using @../..@ if necessary.
+makeRelativeToDir :: FilePath -> FilePath -> IO FilePath
+makeRelativeToDir path dir =
+    makeRelativeCanonical <$> canonicalizePath path <*> canonicalizePath dir
+
+-- | Given a canonical absolute path and canonical absolute dir, make the path
+-- relative to the directory, including using @../..@ if necessary. Returns
+-- the original absolute path if it is not on the same drive as the given dir.
+makeRelativeCanonical :: FilePath -> FilePath -> FilePath
+makeRelativeCanonical path dir
+  | takeDrive path /= takeDrive dir = path
+  | otherwise                       = go (splitPath path) (splitPath dir)
+  where
+    go (p:ps) (d:ds) | p == d = go ps ds
+    go    []     []           = "./"
+    go    ps     ds           = joinPath (replicate (length ds) ".." ++ ps)
 
 -- | Convert a 'FilePath' to a lazy 'ByteString'. Each 'Char' is
 -- encoded as a little-endian 'Word32'.
@@ -187,13 +228,12 @@ byteStringToFilePath bs | bslen `mod` 4 /= 0 = unexpected
         b2 = fromIntegral $ BS.index bs (i + 2)
         b3 = fromIntegral $ BS.index bs (i + 3)
 
--- | Workaround for the inconsistent behaviour of 'canonicalizePath'. It throws
--- an error if the path refers to a non-existent file on *nix, but not on
--- Windows.
+-- | Workaround for the inconsistent behaviour of 'canonicalizePath'. Always
+-- throws an error if the path refers to a non-existent file.
 tryCanonicalizePath :: FilePath -> IO FilePath
 tryCanonicalizePath path = do
   ret <- canonicalizePath path
-#if defined(mingw32_HOST_OS)
+#if defined(mingw32_HOST_OS) || MIN_VERSION_directory(1,2,3)
   exists <- liftM2 (||) (doesFileExist ret) (doesDirectoryExist ret)
   unless exists $
     ioError $ mkIOError doesNotExistErrorType "canonicalizePath"

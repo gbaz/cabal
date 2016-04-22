@@ -1,6 +1,9 @@
 -*-change-log-*-
 
-1.23.x.x (current development version)
+1.25.x.x (current development version)
+	* Made the solver aware of pkg-config constraints (#3023).
+
+1.24.0.0 Ryan Thomas <ryan@ryant.org> March 2016
 	* If there are multiple remote repos, 'cabal update' now updates
 	them in parallel (#2503).
 	* New 'cabal upload' option '-P'/'--password-command' for reading
@@ -18,13 +21,46 @@
 	* Automatically use https for cabal upload for the main
 	hackage.haskell.org (other repos will use whatever they are
 	configured to use).
-	* Support for dependencies of custom Setup.hs scripts.
+	* Support for dependencies of custom Setup.hs scripts
+	(see http://www.well-typed.com/blog/2015/07/cabal-setup-deps/).
 	* 'cabal' program itself now can be used as an external setup
 	method. This fixes an issue when Cabal version mismatch caused
 	unnecessary reconfigures (#2633).
 	* Improved error message for unsatisfiable package constraints
 	(#2727).
 	* Fixed a space leak in 'cabal update' (#2826).
+	* 'cabal exec' and 'sandbox hc-pkg' now use the configured
+	compiler (#2859).
+	* New 'cabal haddock' option: '--for-hackage' (#2852).
+	* Added a warning when the solver cannot find a dependency (#2853).
+	* New 'cabal upload' option: '--doc': upload documentation to
+	hackage (#2890).
+	* Improved error handling for 'sandbox delete-source' (#2943).
+	* Solver support for extension and language flavours (#2873).
+	* Support for secure repos using hackage-security (#2983).
+	* Added a log file message similar to one printed by 'make' when
+	building in another directory (#2642).
+	* Added new subcommand 'init' to 'cabal user-config'. This
+	subcommand creates a cabal configuration file in either the
+	default location or as specified by --config-file (#2553).
+	* The man page for 'cabal-install' is now automatically generated
+	(#2877).
+	* The '--allow-newer' option now works as expected when specified
+	multiple times (#2588).
+	* New config file field: 'extra-framework-dirs' (extra locations
+	to find OS X frameworks in). Can be also specified as an argument
+	for 'install' and 'configure' commands (#3158).
+	* It's now possible to limit the scope of '--allow-newer' to
+	single packages in the install plan (#2756).
+	* Full '--allow-newer' syntax is now supported in the config file
+	(that is, 'allow-newer: base, ghc-prim,  some-package:vector')
+	(#3171).
+	* Improved performance of '--reorder-goals' (#3208).
+	* Fixed space leaks in modular solver (#2916, #2914).
+	* Added a new command: 'gen-bounds' (#3223). See
+	http://softwaresimply.blogspot.se/2015/08/cabal-gen-bounds-easy-generation-of.html.
+	* Tech preview of new nix-style isolated project-based builds.
+	Currently provides the commands (new-)build/repl/configure.
 
 1.22.0.0 Johan Tibell <johan.tibell@gmail.com> January 2015
 	* New command: user-config (#2159).

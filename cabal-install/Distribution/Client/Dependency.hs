@@ -53,10 +53,11 @@ module Distribution.Client.Dependency (
     setStrongFlags,
     setMaxBackjumps,
     addSourcePackages,
-    hideInstalledPackagesSpecificByInstalledPackageId,
+    hideInstalledPackagesSpecificByUnitId,
     hideInstalledPackagesSpecificBySourcePackageId,
     hideInstalledPackagesAllVersions,
-    removeUpperBounds
+    removeUpperBounds,
+    addDefaultSetupDependencies,
   ) where
 
 import Distribution.Client.Dependency.TopDown
@@ -67,16 +68,19 @@ import qualified Distribution.Client.PackageIndex as PackageIndex
 import Distribution.Simple.PackageIndex (InstalledPackageIndex)
 import qualified Distribution.Simple.PackageIndex as InstalledPackageIndex
 import qualified Distribution.Client.InstallPlan as InstallPlan
-import Distribution.Client.InstallPlan (InstallPlan)
+import Distribution.Client.InstallPlan (SolverInstallPlan)
+import Distribution.Client.PkgConfigDb (PkgConfigDb)
 import Distribution.Client.Types
          ( SourcePackageDb(SourcePackageDb), SourcePackage(..)
-         , ConfiguredPackage(..), ConfiguredId(..), enableStanzas )
+         , SolverPackage(..), SolverId(..)
+         , UnresolvedPkgLoc, UnresolvedSourcePackage
+         , OptionalStanza(..), enableStanzas )
 import Distribution.Client.Dependency.Types
          ( PreSolver(..), Solver(..), DependencyResolver, ResolverPackage(..)
          , PackageConstraint(..), showPackageConstraint
          , LabeledPackageConstraint(..), unlabelPackageConstraint
          , ConstraintSource(..), showConstraintSource
-         , AllowNewer(..), PackagePreferences(..), InstalledPreference(..)
+         , PackagePreferences(..), InstalledPreference(..)
          , PackagesPreferenceDefault(..)
          , Progress(..), foldProgress )
 import Distribution.Client.Sandbox.Types
@@ -88,20 +92,16 @@ import qualified Distribution.InstalledPackageInfo as Installed
 import Distribution.Package
          ( PackageName(..), PackageIdentifier(PackageIdentifier), PackageId
          , Package(..), packageName, packageVersion
-         , InstalledPackageId, Dependency(Dependency))
+         , UnitId, Dependency(Dependency))
 import qualified Distribution.PackageDescription as PD
-         ( PackageDescription(..), Library(..), Executable(..)
-         , TestSuite(..), Benchmark(..), SetupBuildInfo(..)
-         , GenericPackageDescription(..), CondTree
-         , Flag(flagName), FlagName(..) )
-import Distribution.PackageDescription (BuildInfo(targetBuildDepends))
+import qualified Distribution.PackageDescription.Configuration as PD
 import Distribution.PackageDescription.Configuration
-         ( mapCondTree, finalizePackageDescription )
+         ( finalizePackageDescription )
 import Distribution.Client.PackageUtils
          ( externalBuildDepends )
 import Distribution.Version
-         ( VersionRange, anyVersion, thisVersion, withinRange
-         , removeUpperBound, simplifyVersionRange )
+         ( Version(..), VersionRange, anyVersion, thisVersion, orLaterVersion
+         , withinRange, simplifyVersionRange )
 import Distribution.Compiler
          ( CompilerInfo(..) )
 import Distribution.System
@@ -110,13 +110,17 @@ import Distribution.Client.Utils
          ( duplicates, duplicatesBy, mergeBy, MergeResult(..) )
 import Distribution.Simple.Utils
          ( comparing, warn, info )
+import Distribution.Simple.Configure
+         ( relaxPackageDeps )
+import Distribution.Simple.Setup
+         ( AllowNewer(..) )
 import Distribution.Text
          ( display )
 import Distribution.Verbosity
          ( Verbosity )
 
 import Data.List
-         ( foldl', sort, sortBy, nubBy, maximumBy, intercalate )
+         ( foldl', sort, sortBy, nubBy, maximumBy, intercalate, nub )
 import Data.Function (on)
 import Data.Maybe (fromMaybe)
 import qualified Data.Map as Map
@@ -140,7 +144,7 @@ data DepResolverParams = DepResolverParams {
        depResolverPreferences       :: [PackagePreference],
        depResolverPreferenceDefault :: PackagesPreferenceDefault,
        depResolverInstalledPkgIndex :: InstalledPackageIndex,
-       depResolverSourcePkgIndex    :: PackageIndex.PackageIndex SourcePackage,
+       depResolverSourcePkgIndex    :: PackageIndex.PackageIndex UnresolvedSourcePackage,
        depResolverReorderGoals      :: Bool,
        depResolverIndependentGoals  :: Bool,
        depResolverAvoidReinstalls   :: Bool,
@@ -158,7 +162,14 @@ showDepResolverParams p =
   ++ "\npreferences: "
   ++   concatMap (("\n  " ++) . showPackagePreference)
        (depResolverPreferences p)
-  ++ "\nstrategy: " ++ show (depResolverPreferenceDefault p)
+  ++ "\nstrategy: "          ++ show (depResolverPreferenceDefault p)
+  ++ "\nreorder goals: "     ++ show (depResolverReorderGoals      p)
+  ++ "\nindependent goals: " ++ show (depResolverIndependentGoals  p)
+  ++ "\navoid reinstalls: "  ++ show (depResolverAvoidReinstalls   p)
+  ++ "\nshadow packages: "   ++ show (depResolverShadowPkgs        p)
+  ++ "\nstrong flags: "      ++ show (depResolverStrongFlags       p)
+  ++ "\nmax backjumps: "     ++ maybe "infinite" show
+                                     (depResolverMaxBackjumps      p)
   where
     showLabeledConstraint :: LabeledPackageConstraint -> String
     showLabeledConstraint (LabeledPackageConstraint pc src) =
@@ -178,6 +189,11 @@ data PackagePreference =
      -- | If we prefer versions of packages that are already installed.
    | PackageInstalledPreference PackageName InstalledPreference
 
+     -- | If we would prefer to enable these optional stanzas
+     -- (i.e. test suites and/or benchmarks)
+   | PackageStanzasPreference   PackageName [OptionalStanza]
+
+
 -- | Provide a textual representation of a package preference
 -- for debugging purposes.
 --
@@ -186,9 +202,11 @@ showPackagePreference (PackageVersionPreference   pn vr) =
   display pn ++ " " ++ display (simplifyVersionRange vr)
 showPackagePreference (PackageInstalledPreference pn ip) =
   display pn ++ " " ++ show ip
+showPackagePreference (PackageStanzasPreference pn st) =
+  display pn ++ " " ++ show st
 
 basicDepResolverParams :: InstalledPackageIndex
-                       -> PackageIndex.PackageIndex SourcePackage
+                       -> PackageIndex.PackageIndex UnresolvedSourcePackage
                        -> DepResolverParams
 basicDepResolverParams installedPkgIndex sourcePkgIndex =
     DepResolverParams {
@@ -282,7 +300,7 @@ dontUpgradeNonUpgradeablePackages params =
       [ LabeledPackageConstraint
         (PackageConstraintInstalled pkgname)
         ConstraintSourceNonUpgradeablePackage
-      | all (/=PackageName "base") (depResolverTargets params)
+      | notElem (PackageName "base") (depResolverTargets params)
       , pkgname <- map PackageName [ "base", "ghc-prim", "integer-gmp"
                                    , "integer-simple" ]
       , isInstalled pkgname ]
@@ -293,7 +311,7 @@ dontUpgradeNonUpgradeablePackages params =
                 . InstalledPackageIndex.lookupPackageName
                                  (depResolverInstalledPkgIndex params)
 
-addSourcePackages :: [SourcePackage]
+addSourcePackages :: [UnresolvedSourcePackage]
                   -> DepResolverParams -> DepResolverParams
 addSourcePackages pkgs params =
     params {
@@ -302,14 +320,14 @@ addSourcePackages pkgs params =
               (depResolverSourcePkgIndex params) pkgs
     }
 
-hideInstalledPackagesSpecificByInstalledPackageId :: [InstalledPackageId]
+hideInstalledPackagesSpecificByUnitId :: [UnitId]
                                                      -> DepResolverParams
                                                      -> DepResolverParams
-hideInstalledPackagesSpecificByInstalledPackageId pkgids params =
+hideInstalledPackagesSpecificByUnitId pkgids params =
     --TODO: this should work using exclude constraints instead
     params {
       depResolverInstalledPkgIndex =
-        foldl' (flip InstalledPackageIndex.deleteInstalledPackageId)
+        foldl' (flip InstalledPackageIndex.deleteUnitId)
                (depResolverInstalledPkgIndex params) pkgids
     }
 
@@ -337,96 +355,71 @@ hideInstalledPackagesAllVersions pkgnames params =
 
 hideBrokenInstalledPackages :: DepResolverParams -> DepResolverParams
 hideBrokenInstalledPackages params =
-    hideInstalledPackagesSpecificByInstalledPackageId pkgids params
+    hideInstalledPackagesSpecificByUnitId pkgids params
   where
-    pkgids = map Installed.installedPackageId
+    pkgids = map Installed.installedUnitId
            . InstalledPackageIndex.reverseDependencyClosure
                             (depResolverInstalledPkgIndex params)
-           . map (Installed.installedPackageId . fst)
+           . map (Installed.installedUnitId . fst)
            . InstalledPackageIndex.brokenPackages
            $ depResolverInstalledPkgIndex params
 
 -- | Remove upper bounds in dependencies using the policy specified by the
 -- 'AllowNewer' argument (all/some/none).
+--
+-- Note: It's important to apply 'removeUpperBounds' after
+-- 'addSourcePackages'. Otherwise, the packages inserted by
+-- 'addSourcePackages' won't have upper bounds in dependencies relaxed.
+--
 removeUpperBounds :: AllowNewer -> DepResolverParams -> DepResolverParams
-removeUpperBounds allowNewer params =
+removeUpperBounds AllowNewerNone params = params
+removeUpperBounds allowNewer     params =
     params {
-      -- NB: It's important to apply 'removeUpperBounds' after
-      -- 'addSourcePackages'. Otherwise, the packages inserted by
-      -- 'addSourcePackages' won't have upper bounds in dependencies relaxed.
-
       depResolverSourcePkgIndex = sourcePkgIndex'
     }
   where
-    sourcePkgIndex  = depResolverSourcePkgIndex params
-    sourcePkgIndex' = case allowNewer of
-      AllowNewerNone      -> sourcePkgIndex
-      AllowNewerAll       -> fmap relaxAllPackageDeps         sourcePkgIndex
-      AllowNewerSome pkgs -> fmap (relaxSomePackageDeps pkgs) sourcePkgIndex
+    sourcePkgIndex' = fmap relaxDeps $ depResolverSourcePkgIndex params
 
-    relaxAllPackageDeps :: SourcePackage -> SourcePackage
-    relaxAllPackageDeps = onAllBuildDepends doRelax
-      where
-        doRelax (Dependency pkgName verRange) =
-          Dependency pkgName (removeUpperBound verRange)
+    relaxDeps :: UnresolvedSourcePackage -> UnresolvedSourcePackage
+    relaxDeps srcPkg = srcPkg {
+      packageDescription = relaxPackageDeps allowNewer
+                           (packageDescription srcPkg)
+      }
 
-    relaxSomePackageDeps :: [PackageName] -> SourcePackage -> SourcePackage
-    relaxSomePackageDeps pkgNames = onAllBuildDepends doRelax
-      where
-        doRelax d@(Dependency pkgName verRange)
-          | pkgName `elem` pkgNames = Dependency pkgName
-                                      (removeUpperBound verRange)
-          | otherwise               = d
-
-    -- Walk a 'GenericPackageDescription' and apply 'f' to all 'build-depends'
-    -- fields.
-    onAllBuildDepends :: (Dependency -> Dependency)
-                      -> SourcePackage -> SourcePackage
-    onAllBuildDepends f srcPkg = srcPkg'
-      where
-        gpd        = packageDescription srcPkg
-        pd         = PD.packageDescription gpd
-        condLib    = PD.condLibrary        gpd
-        condExes   = PD.condExecutables    gpd
-        condTests  = PD.condTestSuites     gpd
-        condBenchs = PD.condBenchmarks     gpd
-
-        f' = onBuildInfo f
-        onBuildInfo g bi = bi
-          { targetBuildDepends = map g (targetBuildDepends bi) }
-
-        onLibrary    lib  = lib { PD.libBuildInfo  = f' $ PD.libBuildInfo  lib }
-        onExecutable exe  = exe { PD.buildInfo     = f' $ PD.buildInfo     exe }
-        onTestSuite  tst  = tst { PD.testBuildInfo = f' $ PD.testBuildInfo tst }
-        onBenchmark  bmk  = bmk { PD.benchmarkBuildInfo =
-                                     f' $ PD.benchmarkBuildInfo bmk }
-
-        srcPkg' = srcPkg { packageDescription = gpd' }
-        gpd'    = gpd {
-          PD.packageDescription = pd',
-          PD.condLibrary        = condLib',
-          PD.condExecutables    = condExes',
-          PD.condTestSuites     = condTests',
-          PD.condBenchmarks     = condBenchs'
+-- | Supply defaults for packages without explicit Setup dependencies
+--
+-- Note: It's important to apply 'addDefaultSetupDepends' after
+-- 'addSourcePackages'. Otherwise, the packages inserted by
+-- 'addSourcePackages' won't have upper bounds in dependencies relaxed.
+--
+addDefaultSetupDependencies :: (UnresolvedSourcePackage -> Maybe [Dependency])
+                            -> DepResolverParams -> DepResolverParams
+addDefaultSetupDependencies defaultSetupDeps params =
+    params {
+      depResolverSourcePkgIndex =
+        fmap applyDefaultSetupDeps (depResolverSourcePkgIndex params)
+    }
+  where
+    applyDefaultSetupDeps :: UnresolvedSourcePackage -> UnresolvedSourcePackage
+    applyDefaultSetupDeps srcpkg =
+        srcpkg {
+          packageDescription = gpkgdesc {
+            PD.packageDescription = pkgdesc {
+              PD.setupBuildInfo =
+                case PD.setupBuildInfo pkgdesc of
+                  Just sbi -> Just sbi
+                  Nothing  -> case defaultSetupDeps srcpkg of
+                    Nothing -> Nothing
+                    Just deps -> Just PD.SetupBuildInfo {
+                      PD.defaultSetupDepends = True,
+                      PD.setupDepends        = deps
+                    }
+            }
           }
-        pd' = pd {
-          PD.buildDepends = map  f            (PD.buildDepends pd),
-          PD.library      = fmap onLibrary    (PD.library pd),
-          PD.executables  = map  onExecutable (PD.executables pd),
-          PD.testSuites   = map  onTestSuite  (PD.testSuites pd),
-          PD.benchmarks   = map  onBenchmark  (PD.benchmarks pd)
-          }
-        condLib'    = fmap (onCondTree onLibrary)             condLib
-        condExes'   = map  (mapSnd $ onCondTree onExecutable) condExes
-        condTests'  = map  (mapSnd $ onCondTree onTestSuite)  condTests
-        condBenchs' = map  (mapSnd $ onCondTree onBenchmark)  condBenchs
-
-        mapSnd :: (a -> b) -> (c,a) -> (c,b)
-        mapSnd = fmap
-
-        onCondTree :: (a -> b) -> PD.CondTree v [Dependency] a
-                   -> PD.CondTree v [Dependency] b
-        onCondTree g = mapCondTree g (map f) id
+        }
+      where
+        gpkgdesc = packageDescription srcpkg
+        pkgdesc  = PD.packageDescription gpkgdesc
 
 
 upgradeDependencies :: DepResolverParams -> DepResolverParams
@@ -440,7 +433,7 @@ reinstallTargets params =
 
 standardInstallPolicy :: InstalledPackageIndex
                       -> SourcePackageDb
-                      -> [PackageSpecifier SourcePackage]
+                      -> [PackageSpecifier UnresolvedSourcePackage]
                       -> DepResolverParams
 standardInstallPolicy
     installedPkgIndex (SourcePackageDb sourcePkgIndex sourcePkgPrefs)
@@ -459,11 +452,40 @@ standardInstallPolicy
   . hideInstalledPackagesSpecificBySourcePackageId
       [ packageId pkg | SpecificSourcePackage pkg <- pkgSpecifiers ]
 
+  . addDefaultSetupDependencies mkDefaultSetupDeps
+
   . addSourcePackages
       [ pkg  | SpecificSourcePackage pkg <- pkgSpecifiers ]
 
   $ basicDepResolverParams
       installedPkgIndex sourcePkgIndex
+
+    where
+      -- Force Cabal >= 1.24 dep when the package is affected by #3199.
+      mkDefaultSetupDeps :: UnresolvedSourcePackage -> Maybe [Dependency]
+      mkDefaultSetupDeps srcpkg | affected        =
+        Just [Dependency (PackageName "Cabal")
+              (orLaterVersion $ Version [1,24] [])]
+                                | otherwise       = Nothing
+        where
+          gpkgdesc = packageDescription srcpkg
+          pkgdesc  = PD.packageDescription gpkgdesc
+          bt       = fromMaybe PD.Custom (PD.buildType pkgdesc)
+          affected = bt == PD.Custom && hasBuildableFalse gpkgdesc
+
+      -- Does this package contain any components with non-empty 'build-depends'
+      -- and a 'buildable' field that could potentially be set to 'False'? False
+      -- positives are possible.
+      hasBuildableFalse :: PD.GenericPackageDescription -> Bool
+      hasBuildableFalse gpkg =
+        not (all alwaysTrue (zipWith PD.cOr buildableConditions noDepConditions))
+        where
+          buildableConditions      = PD.extractConditions PD.buildable gpkg
+          noDepConditions          = PD.extractConditions
+                                     (null . PD.targetBuildDepends)    gpkg
+          alwaysTrue (PD.Lit True) = True
+          alwaysTrue _             = False
+
 
 applySandboxInstallPolicy :: SandboxPackageInfo
                              -> DepResolverParams
@@ -521,7 +543,7 @@ chooseSolver verbosity preSolver _cinfo =
         info verbosity "Choosing modular solver."
         return Modular
 
-runSolver :: Solver -> SolverConfig -> DependencyResolver
+runSolver :: Solver -> SolverConfig -> DependencyResolver UnresolvedPkgLoc
 runSolver TopDown = const topDownResolver -- TODO: warn about unsupported options
 runSolver Modular = modularResolver
 
@@ -533,25 +555,26 @@ runSolver Modular = modularResolver
 --
 resolveDependencies :: Platform
                     -> CompilerInfo
+                    -> PkgConfigDb
                     -> Solver
                     -> DepResolverParams
-                    -> Progress String String InstallPlan
+                    -> Progress String String SolverInstallPlan
 
     --TODO: is this needed here? see dontUpgradeNonUpgradeablePackages
-resolveDependencies platform comp _solver params
+resolveDependencies platform comp _pkgConfigDB _solver params
   | null (depResolverTargets params)
   = return (validateSolverResult platform comp indGoals [])
   where
     indGoals = depResolverIndependentGoals params
 
-resolveDependencies platform comp  solver params =
+resolveDependencies platform comp pkgConfigDB solver params =
 
     Step (showDepResolverParams finalparams)
   $ fmap (validateSolverResult platform comp indGoals)
   $ runSolver solver (SolverConfig reorderGoals indGoals noReinstalls
                       shadowing strFlags maxBkjumps)
                      platform comp installedPkgIndex sourcePkgIndex
-                     preferences constraints targets
+                     pkgConfigDB preferences constraints targets
   where
 
     finalparams @ (DepResolverParams
@@ -586,14 +609,15 @@ interpretPackagesPreference :: Set PackageName
                             -> [PackagePreference]
                             -> (PackageName -> PackagePreferences)
 interpretPackagesPreference selected defaultPref prefs =
-  \pkgname -> PackagePreferences (versionPref pkgname) (installPref pkgname)
-
+  \pkgname -> PackagePreferences (versionPref pkgname)
+                                 (installPref pkgname)
+                                 (stanzasPref pkgname)
   where
     versionPref pkgname =
-      fromMaybe anyVersion (Map.lookup pkgname versionPrefs)
-    versionPrefs = Map.fromList
-      [ (pkgname, pref)
-      | PackageVersionPreference pkgname pref <- prefs ]
+      fromMaybe [anyVersion] (Map.lookup pkgname versionPrefs)
+    versionPrefs = Map.fromListWith (++)
+                   [(pkgname, [pref])
+                   | PackageVersionPreference pkgname pref <- prefs]
 
     installPref pkgname =
       fromMaybe (installPrefDefault pkgname) (Map.lookup pkgname installPrefs)
@@ -601,13 +625,20 @@ interpretPackagesPreference selected defaultPref prefs =
       [ (pkgname, pref)
       | PackageInstalledPreference pkgname pref <- prefs ]
     installPrefDefault = case defaultPref of
-      PreferAllLatest         -> \_       -> PreferLatest
-      PreferAllInstalled      -> \_       -> PreferInstalled
+      PreferAllLatest         -> const PreferLatest
+      PreferAllInstalled      -> const PreferInstalled
       PreferLatestForSelected -> \pkgname ->
         -- When you say cabal install foo, what you really mean is, prefer the
         -- latest version of foo, but the installed version of everything else
         if pkgname `Set.member` selected then PreferLatest
                                          else PreferInstalled
+
+    stanzasPref pkgname =
+      fromMaybe [] (Map.lookup pkgname stanzasPrefs)
+    stanzasPrefs = Map.fromListWith (\a b -> nub (a ++ b))
+      [ (pkgname, pref)
+      | PackageStanzasPreference pkgname pref <- prefs ]
+
 
 -- ------------------------------------------------------------
 -- * Checking the result of the solver
@@ -619,8 +650,8 @@ interpretPackagesPreference selected defaultPref prefs =
 validateSolverResult :: Platform
                      -> CompilerInfo
                      -> Bool
-                     -> [ResolverPackage]
-                     -> InstallPlan
+                     -> [ResolverPackage UnresolvedPkgLoc]
+                     -> SolverInstallPlan
 validateSolverResult platform comp indepGoals pkgs =
     case planPackagesProblems platform comp pkgs of
       [] -> case InstallPlan.new indepGoals index of
@@ -637,7 +668,7 @@ validateSolverResult platform comp indepGoals pkgs =
     formatPkgProblems  = formatProblemMessage . map showPlanPackageProblem
     formatPlanProblems = formatProblemMessage . map InstallPlan.showPlanProblem
 
-    formatProblemMessage problems = 
+    formatProblemMessage problems =
       unlines $
         "internal error: could not construct a valid install plan."
       : "The proposed (invalid) plan contained the following problems:"
@@ -647,7 +678,7 @@ validateSolverResult platform comp indepGoals pkgs =
 
 
 data PlanPackageProblem =
-       InvalidConfiguredPackage ConfiguredPackage [PackageProblem]
+       InvalidConfiguredPackage (SolverPackage UnresolvedPkgLoc) [PackageProblem]
 
 showPlanPackageProblem :: PlanPackageProblem -> String
 showPlanPackageProblem (InvalidConfiguredPackage pkg packageProblems) =
@@ -657,7 +688,7 @@ showPlanPackageProblem (InvalidConfiguredPackage pkg packageProblems) =
              | problem <- packageProblems ]
 
 planPackagesProblems :: Platform -> CompilerInfo
-                     -> [ResolverPackage]
+                     -> [ResolverPackage UnresolvedPkgLoc]
                      -> [PlanPackageProblem]
 planPackagesProblems platform cinfo pkgs =
      [ InvalidConfiguredPackage pkg packageProblems
@@ -706,9 +737,9 @@ showPackageProblem (InvalidDep dep pkgid) =
 -- dependencies are satisfied by the specified packages.
 --
 configuredPackageProblems :: Platform -> CompilerInfo
-                          -> ConfiguredPackage -> [PackageProblem]
+                          -> SolverPackage UnresolvedPkgLoc -> [PackageProblem]
 configuredPackageProblems platform cinfo
-  (ConfiguredPackage pkg specifiedFlags stanzas specifiedDeps') =
+  (SolverPackage pkg specifiedFlags stanzas specifiedDeps') =
      [ DuplicateFlag flag | ((flag,_):_) <- duplicates specifiedFlags ]
   ++ [ MissingFlag flag | OnlyInLeft  flag <- mergedFlags ]
   ++ [ ExtraFlag   flag | OnlyInRight flag <- mergedFlags ]
@@ -721,7 +752,7 @@ configuredPackageProblems platform cinfo
                             , not (packageSatisfiesDependency pkgid dep) ]
   where
     specifiedDeps :: ComponentDeps [PackageId]
-    specifiedDeps = fmap (map confSrcId) specifiedDeps'
+    specifiedDeps = fmap (map solverSrcId) specifiedDeps'
 
     mergedFlags = mergeBy compare
       (sort $ map PD.flagName (PD.genPackageFlags (packageDescription pkg)))
@@ -787,14 +818,14 @@ configuredPackageProblems platform cinfo
 -- It simply means preferences for installed packages will be ignored.
 --
 resolveWithoutDependencies :: DepResolverParams
-                           -> Either [ResolveNoDepsError] [SourcePackage]
+                           -> Either [ResolveNoDepsError] [UnresolvedSourcePackage]
 resolveWithoutDependencies (DepResolverParams targets constraints
                               prefs defpref installedPkgIndex sourcePkgIndex
                               _reorderGoals _indGoals _avoidReinstalls
                               _shadowing _strFlags _maxBjumps) =
     collectEithers (map selectPackage targets)
   where
-    selectPackage :: PackageName -> Either ResolveNoDepsError SourcePackage
+    selectPackage :: PackageName -> Either ResolveNoDepsError UnresolvedSourcePackage
     selectPackage pkgname
       | null choices = Left  $! ResolveUnsatisfiable pkgname requiredVersions
       | otherwise    = Right $! maximumBy bestByPrefs choices
@@ -807,7 +838,7 @@ resolveWithoutDependencies (DepResolverParams targets constraints
                                                          pkgDependency
 
         -- Preferences
-        PackagePreferences preferredVersions preferInstalled
+        PackagePreferences preferredVersions preferInstalled _
           = packagePreferences pkgname
 
         bestByPrefs   = comparing $ \pkg ->
@@ -818,7 +849,8 @@ resolveWithoutDependencies (DepResolverParams targets constraints
                            . InstalledPackageIndex.lookupSourcePackageId
                                                      installedPkgIndex
                            . packageId
-        versionPref   pkg = packageVersion pkg `withinRange` preferredVersions
+        versionPref pkg = length . filter (packageVersion pkg `withinRange`) $
+                          preferredVersions
 
     packageConstraints :: PackageName -> VersionRange
     packageConstraints pkgname =

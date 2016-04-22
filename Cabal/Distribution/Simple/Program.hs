@@ -38,7 +38,8 @@ module Distribution.Simple.Program (
     , ProgramSearchPath
     , ProgramSearchPathEntry(..)
     , simpleProgram
-    , findProgramLocation
+    , findProgramOnSearchPath
+    , defaultProgramSearchPath
     , findProgramVersion
 
     -- * Configured program and related functions
@@ -122,6 +123,7 @@ module Distribution.Simple.Program (
     , rawSystemProgramConf
     , rawSystemProgramStdoutConf
     , findProgramOnPath
+    , findProgramLocation
 
     ) where
 
@@ -129,11 +131,9 @@ import Distribution.Simple.Program.Types
 import Distribution.Simple.Program.Run
 import Distribution.Simple.Program.Db
 import Distribution.Simple.Program.Builtin
-
+import Distribution.Simple.Program.Find
 import Distribution.Simple.Utils
-         ( die, findProgramLocation, findProgramVersion )
 import Distribution.Verbosity
-         ( Verbosity )
 
 
 -- | Runs the given configured program.
@@ -217,6 +217,8 @@ restoreProgramConfiguration :: [Program] -> ProgramConfiguration
                                          -> ProgramConfiguration
 restoreProgramConfiguration = restoreProgramDb
 
-{-# DEPRECATED findProgramOnPath "use findProgramLocation instead" #-}
+{-# DEPRECATED findProgramOnPath "use findProgramOnSearchPath instead" #-}
 findProgramOnPath :: String -> Verbosity -> IO (Maybe FilePath)
-findProgramOnPath = flip findProgramLocation
+findProgramOnPath name verbosity =
+    fmap (fmap fst) $
+    findProgramOnSearchPath verbosity defaultProgramSearchPath name

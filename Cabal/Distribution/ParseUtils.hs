@@ -1,4 +1,3 @@
-{-# LANGUAGE CPP #-}
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.ParseUtils
@@ -40,21 +39,17 @@ module Distribution.ParseUtils (
         UnrecFieldParser, warnUnrec, ignoreUnrec,
   ) where
 
-import Distribution.Compiler (CompilerFlavor, parseCompilerFlavorCompat)
+import Distribution.Compiler
 import Distribution.License
 import Distribution.Version
-         ( Version(..), VersionRange, anyVersion )
-import Distribution.Package     ( PackageName(..), Dependency(..) )
-import Distribution.ModuleName (ModuleName)
+import Distribution.Package
+import Distribution.ModuleName
+import qualified Distribution.Compat.MonadFail as Fail
 import Distribution.Compat.ReadP as ReadP hiding (get)
 import Distribution.ReadE
 import Distribution.Text
-         ( Text(..) )
 import Distribution.Simple.Utils
-         ( comparing, dropWhileEndLE, intercalate, lowercase
-         , normaliseLineEndings )
 import Language.Haskell.Extension
-         ( Language, Extension )
 
 import Text.PrettyPrint hiding (braces)
 import Data.Char (isSpace, toLower, isAlphaNum, isDigit)
@@ -62,9 +57,7 @@ import Data.Maybe       (fromMaybe)
 import Data.Tree as Tree (Tree(..), flatten)
 import qualified Data.Map as Map
 import Control.Monad (foldM, ap)
-#if __GLASGOW_HASKELL__ < 710
-import Control.Applicative (Applicative(..))
-#endif
+import Control.Applicative as AP (Applicative(..))
 import System.FilePath (normalise)
 import Data.List (sortBy)
 
@@ -98,16 +91,19 @@ instance Functor ParseResult where
         fmap f (ParseOk ws x) = ParseOk ws $ f x
 
 instance Applicative ParseResult where
-        pure = return
+        pure = ParseOk []
         (<*>) = ap
 
 
 instance Monad ParseResult where
-        return = ParseOk []
+        return = AP.pure
         ParseFailed err >>= _ = ParseFailed err
         ParseOk ws x >>= f = case f x of
                                ParseFailed err -> ParseFailed err
                                ParseOk ws' x' -> ParseOk (ws'++ws) x'
+        fail = Fail.fail
+
+instance Fail.MonadFail ParseResult where
         fail s = ParseFailed (FromString s Nothing)
 
 catchParseError :: ParseResult a -> (PError -> ParseResult a)
@@ -660,8 +656,7 @@ parseVersionRangeQ = parseQuoted parse <++ parse
 parseOptVersion :: ReadP r Version
 parseOptVersion = parseQuoted ver <++ ver
   where ver :: ReadP r Version
-        ver = parse <++ return noVersion
-        noVersion = Version [] []
+        ver = parse <++ return (Version [] [])
 
 parseTestedWithQ :: ReadP r (CompilerFlavor,VersionRange)
 parseTestedWithQ = parseQuoted tw <++ tw

@@ -12,42 +12,44 @@ module Distribution.Client.Sandbox.Index (
     addBuildTreeRefs,
     removeBuildTreeRefs,
     ListIgnoredBuildTreeRefs(..), RefTypesToList(..),
+    DeleteSourceError(..),
     listBuildTreeRefs,
     validateIndexPath,
 
     defaultIndexFileName
   ) where
 
+import qualified Codec.Archive.Tar       as Tar
+import qualified Codec.Archive.Tar.Entry as Tar
+import qualified Codec.Archive.Tar.Index as Tar
 import qualified Distribution.Client.Tar as Tar
 import Distribution.Client.IndexUtils ( BuildTreeRefType(..)
                                       , refTypeFromTypeCode
                                       , typeCodeFromRefType
                                       , updatePackageIndexCacheFile
-                                      , getSourcePackagesStrict )
-import Distribution.Client.PackageIndex ( allPackages )
-import Distribution.Client.Types ( Repo(..), LocalRepo(..)
-                                 , SourcePackageDb(..)
-                                 , SourcePackage(..), PackageLocation(..) )
+                                      , readCacheStrict
+                                      , Index(..) )
+import qualified Distribution.Client.IndexUtils as IndexUtils
 import Distribution.Client.Utils ( byteStringToFilePath, filePathToByteString
                                  , makeAbsoluteToCwd, tryCanonicalizePath
-                                 , canonicalizePathNoThrow
                                  , tryFindAddSourcePackageDesc  )
 
 import Distribution.Simple.Utils ( die, debug )
+import Distribution.Compat.Exception   ( tryIO )
 import Distribution.Verbosity    ( Verbosity )
 
 import qualified Data.ByteString.Lazy as BS
-import Control.Exception         ( evaluate )
+import Control.Exception         ( evaluate, throw, Exception )
 import Control.Monad             ( liftM, unless )
-import Data.List                 ( (\\), intersect, nub )
-import Data.Maybe                ( catMaybes )
+import Control.Monad.Writer.Lazy (WriterT(..), runWriterT, tell)
+import Data.List                 ( (\\), intersect, nub, find )
+import Data.Maybe                ( catMaybes, fromMaybe )
+import Data.Either               (partitionEithers)
 import System.Directory          ( createDirectoryIfMissing,
                                    doesDirectoryExist, doesFileExist,
-                                   renameFile )
-import System.FilePath           ( (</>), (<.>), takeDirectory, takeExtension
-                                 , replaceExtension )
-import System.IO                 ( IOMode(..), SeekMode(..)
-                                 , hSeek, withBinaryFile )
+                                   renameFile, canonicalizePath)
+import System.FilePath           ( (</>), (<.>), takeDirectory, takeExtension )
+import System.IO                 ( IOMode(..), withBinaryFile )
 
 -- | A reference to a local build tree.
 data BuildTreeRef = BuildTreeRef {
@@ -80,15 +82,26 @@ readBuildTreeRef entry = case Tar.entryContent entry of
 
 -- | Given a sequence of tar archive entries, extract all references to local
 -- build trees.
-readBuildTreeRefs :: Tar.Entries -> [BuildTreeRef]
+readBuildTreeRefs :: Exception e => Tar.Entries e -> [BuildTreeRef]
 readBuildTreeRefs =
   catMaybes
-  . Tar.foldrEntries (\e r -> readBuildTreeRef e : r)
-  [] error
+  . Tar.foldEntries (\e r -> readBuildTreeRef e : r)
+                    [] throw
 
 -- | Given a path to a tar archive, extract all references to local build trees.
 readBuildTreeRefsFromFile :: FilePath -> IO [BuildTreeRef]
 readBuildTreeRefsFromFile = liftM (readBuildTreeRefs . Tar.read) . BS.readFile
+
+-- | Read build tree references from an index cache
+readBuildTreeRefsFromCache :: Verbosity -> FilePath -> IO [BuildTreeRef]
+readBuildTreeRefsFromCache verbosity indexPath = do
+    (mRefs, _prefs) <- readCacheStrict verbosity (SandboxIndex indexPath) buildTreeRef
+    return (catMaybes mRefs)
+  where
+    buildTreeRef pkgEntry =
+      case pkgEntry of
+         IndexUtils.NormalPackage _ _ _ _ -> Nothing
+         IndexUtils.BuildTreeRef typ _ _ path _ -> Just $ BuildTreeRef typ path
 
 -- | Given a local build tree ref, serialise it to a tar archive entry.
 writeBuildTreeRef :: BuildTreeRef -> Tar.Entry
@@ -143,44 +156,75 @@ addBuildTreeRefs verbosity path l' refType = do
   treesToAdd <- mapM (buildTreeRefFromPath refType) (l \\ treesInIndex)
   let entries = map writeBuildTreeRef (catMaybes treesToAdd)
   unless (null entries) $ do
-    offset <-
-      fmap (Tar.foldrEntries (\e acc -> Tar.entrySizeInBytes e + acc) 0 error
-            . Tar.read) $ BS.readFile path
-    _ <- evaluate offset
-    debug verbosity $ "Writing at offset: " ++ show offset
     withBinaryFile path ReadWriteMode $ \h -> do
-      hSeek h AbsoluteSeek (fromIntegral offset)
+      block <- Tar.hSeekEndEntryOffset h Nothing
+      debug verbosity $ "Writing at tar block: " ++ show block
       BS.hPut h (Tar.write entries)
       debug verbosity $ "Successfully appended to '" ++ path ++ "'"
-    updatePackageIndexCacheFile verbosity path
-      (path `replaceExtension` "cache")
+    updatePackageIndexCacheFile verbosity $ SandboxIndex path
+
+data DeleteSourceError = ErrNonregisteredSource { nrPath :: FilePath }
+                       | ErrNonexistentSource   { nePath :: FilePath } deriving Show
 
 -- | Remove given local build tree references from the index.
-removeBuildTreeRefs :: Verbosity -> FilePath -> [FilePath] -> IO [FilePath]
+--
+-- Returns a tuple with either removed build tree refs or errors and a function
+-- that converts from a provided build tree ref to corresponding full directory path.
+removeBuildTreeRefs :: Verbosity -> FilePath -> [FilePath]
+                       -> IO ([Either DeleteSourceError FilePath],
+                              (FilePath -> FilePath))
 removeBuildTreeRefs _         _   [] =
   error "Distribution.Client.Sandbox.Index.removeBuildTreeRefs: unexpected"
-removeBuildTreeRefs verbosity path l' = do
-  checkIndexExists path
-  l <- mapM canonicalizePathNoThrow l'
-  let tmpFile = path <.> "tmp"
+removeBuildTreeRefs verbosity indexPath l = do
+  checkIndexExists indexPath
+  let tmpFile = indexPath <.> "tmp"
+
+  canonRes <- mapM (\btr -> do res <- tryIO $ canonicalizePath btr
+                               return $ case res of
+                                 Right pth -> Right (btr, pth)
+                                 Left _ -> Left $ ErrNonexistentSource btr) l
+  let (failures, convDict) = partitionEithers canonRes
+      allRefs = fmap snd convDict
+
   -- Performance note: on my system, it takes 'index --remove-source'
   -- approx. 3,5s to filter a 65M file. Real-life indices are expected to be
   -- much smaller.
-  BS.writeFile tmpFile . Tar.writeEntries . Tar.filterEntries (p l) . Tar.read
-    =<< BS.readFile path
-  renameFile tmpFile path
+  removedRefs <- doRemove convDict tmpFile
+
+  renameFile tmpFile indexPath
   debug verbosity $ "Successfully renamed '" ++ tmpFile
-    ++ "' to '" ++ path ++ "'"
-  updatePackageIndexCacheFile verbosity path (path `replaceExtension` "cache")
-  -- FIXME: return only the refs that vere actually removed.
-  return l
+    ++ "' to '" ++ indexPath ++ "'"
+
+  unless (null removedRefs) $
+    updatePackageIndexCacheFile verbosity $ SandboxIndex indexPath
+
+  let results = fmap Right removedRefs
+                ++ fmap Left failures
+                ++ fmap (Left . ErrNonregisteredSource)
+                        (fmap (convertWith convDict) (allRefs \\ removedRefs))
+
+  return (results, convertWith convDict)
+
     where
-      p l entry = case readBuildTreeRef entry of
-        Nothing                     -> True
+      doRemove :: [(FilePath, FilePath)] -> FilePath -> IO [FilePath]
+      doRemove srcRefs tmpFile = do
+        (newIdx, changedPaths) <-
+          Tar.read `fmap` BS.readFile indexPath
+          >>= runWriterT . Tar.filterEntriesM (p $ fmap snd srcRefs)
+        BS.writeFile tmpFile . Tar.write . Tar.entriesToList $ newIdx
+        return changedPaths
+
+      p :: [FilePath] -> Tar.Entry -> WriterT [FilePath] IO Bool
+      p refs entry = case readBuildTreeRef entry of
+        Nothing -> return True
         -- FIXME: removing snapshot deps is done with `delete-source
         -- .cabal-sandbox/snapshots/$SNAPSHOT_NAME`. Perhaps we also want to
         -- support removing snapshots by providing the original path.
-        (Just (BuildTreeRef _ pth)) -> pth `notElem` l
+        (Just (BuildTreeRef _ pth)) -> if pth `elem` refs
+                                       then tell [pth] >> return False
+                                       else return True
+
+      convertWith dict pth = fromMaybe pth $ fmap fst $ find ((==pth) . snd) dict
 
 -- | A build tree ref can become ignored if the user later adds a build tree ref
 -- with the same package ID. We display ignored build tree refs when the user
@@ -222,16 +266,11 @@ listBuildTreeRefs verbosity listIgnored refTypesToList path = do
         LinksAndSnapshots -> const True
 
       listWithIgnored :: IO [BuildTreeRef]
-      listWithIgnored = readBuildTreeRefsFromFile $ path
+      listWithIgnored = readBuildTreeRefsFromFile path
 
       listWithoutIgnored :: IO [FilePath]
-      listWithoutIgnored = do
-        let repo = Repo { repoKind = Right LocalRepo
-                        , repoLocalDir = takeDirectory path }
-        pkgIndex <- fmap packageIndex
-                    . getSourcePackagesStrict verbosity $ [repo]
-        return [ pkgPath | (LocalUnpackedPackage pkgPath) <-
-                    map packageSource . allPackages $ pkgIndex ]
+      listWithoutIgnored = fmap (map buildTreePath)
+                         $ readBuildTreeRefsFromCache verbosity path
 
 
 -- | Check that the package index file exists and exit with error if it does not.

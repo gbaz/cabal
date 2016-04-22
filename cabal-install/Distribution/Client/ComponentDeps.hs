@@ -10,6 +10,7 @@
 -- > import qualified Distribution.Client.ComponentDeps as CD
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE DeriveFunctor #-}
+{-# LANGUAGE DeriveGeneric #-}
 module Distribution.Client.ComponentDeps (
     -- * Fine-grained package dependencies
     Component(..)
@@ -20,6 +21,7 @@ module Distribution.Client.ComponentDeps (
   , fromList
   , singleton
   , insert
+  , filterDeps
   , fromLibraryDeps
   , fromSetupDeps
   , fromInstalled
@@ -34,6 +36,9 @@ module Distribution.Client.ComponentDeps (
 
 import Data.Map (Map)
 import qualified Data.Map as Map
+import Distribution.Compat.Binary (Binary)
+import Distribution.Compat.Semigroup (Semigroup((<>)))
+import GHC.Generics
 import Data.Foldable (fold)
 
 #if !MIN_VERSION_base(4,8,0)
@@ -46,33 +51,43 @@ import Data.Traversable (Traversable(traverse))
   Types
 -------------------------------------------------------------------------------}
 
--- | Component of a package
+-- | Component of a package.
 data Component =
-    ComponentLib
+    ComponentLib   String
   | ComponentExe   String
   | ComponentTest  String
   | ComponentBench String
   | ComponentSetup
-  deriving (Show, Eq, Ord)
+  deriving (Show, Eq, Ord, Generic)
 
--- | Dependency for a single component
+instance Binary Component
+
+-- | Dependency for a single component.
 type ComponentDep a = (Component, a)
 
--- | Fine-grained dependencies for a package
+-- | Fine-grained dependencies for a package.
+--
+-- Typically used as @ComponentDeps [Dependency]@, to represent the list of
+-- dependencies for each named component within a package.
+--
 newtype ComponentDeps a = ComponentDeps { unComponentDeps :: Map Component a }
-  deriving (Show, Functor, Eq, Ord)
+  deriving (Show, Functor, Eq, Ord, Generic)
 
-instance Monoid a => Monoid (ComponentDeps a) where
-  mempty =
-    ComponentDeps Map.empty
-  (ComponentDeps d) `mappend` (ComponentDeps d') =
-    ComponentDeps (Map.unionWith mappend d d')
+instance Semigroup a => Monoid (ComponentDeps a) where
+  mempty = ComponentDeps Map.empty
+  mappend = (<>)
+
+instance Semigroup a => Semigroup (ComponentDeps a) where
+  ComponentDeps d <> ComponentDeps d' =
+      ComponentDeps (Map.unionWith (<>) d d')
 
 instance Foldable ComponentDeps where
   foldMap f = foldMap f . unComponentDeps
 
 instance Traversable ComponentDeps where
   traverse f = fmap ComponentDeps . traverse f . unComponentDeps
+
+instance Binary a => Binary (ComponentDeps a)
 
 {-------------------------------------------------------------------------------
   Construction
@@ -93,18 +108,22 @@ insert comp a = ComponentDeps . Map.alter aux comp . unComponentDeps
     aux Nothing   = Just a
     aux (Just a') = Just $ a `mappend` a'
 
--- | ComponentDeps containing library dependencies only
-fromLibraryDeps :: a -> ComponentDeps a
-fromLibraryDeps = singleton ComponentLib
+-- | Keep only selected components (and their associated deps info).
+filterDeps :: (Component -> a -> Bool) -> ComponentDeps a -> ComponentDeps a
+filterDeps p = ComponentDeps . Map.filterWithKey p . unComponentDeps
 
--- | ComponentDeps containing setup dependencies only
+-- | ComponentDeps containing library dependencies only
+fromLibraryDeps :: String -> a -> ComponentDeps a
+fromLibraryDeps n = singleton (ComponentLib n)
+
+-- | ComponentDeps containing setup dependencies only.
 fromSetupDeps :: a -> ComponentDeps a
 fromSetupDeps = singleton ComponentSetup
 
--- | ComponentDeps for installed packages
+-- | ComponentDeps for installed packages.
 --
--- We assume that installed packages only record their library dependencies
-fromInstalled :: a -> ComponentDeps a
+-- We assume that installed packages only record their library dependencies.
+fromInstalled :: String -> a -> ComponentDeps a
 fromInstalled = fromLibraryDeps
 
 {-------------------------------------------------------------------------------
@@ -114,7 +133,7 @@ fromInstalled = fromLibraryDeps
 toList :: ComponentDeps a -> [ComponentDep a]
 toList = Map.toList . unComponentDeps
 
--- | All dependencies of a package
+-- | All dependencies of a package.
 --
 -- This is just a synonym for 'fold', but perhaps a use of 'flatDeps' is more
 -- obvious than a use of 'fold', and moreover this avoids introducing lots of
@@ -122,21 +141,22 @@ toList = Map.toList . unComponentDeps
 flatDeps :: Monoid a => ComponentDeps a -> a
 flatDeps = fold
 
--- | All dependencies except the setup dependencies
+-- | All dependencies except the setup dependencies.
 --
--- Prior to the introduction of setup dependencies (TODO: Version? 1.23) this
--- would have been _all_ dependencies
+-- Prior to the introduction of setup dependencies in version 1.24 this
+-- would have been _all_ dependencies.
 nonSetupDeps :: Monoid a => ComponentDeps a -> a
 nonSetupDeps = select (/= ComponentSetup)
 
--- | Library dependencies proper only
+-- | Library dependencies proper only.
 libraryDeps :: Monoid a => ComponentDeps a -> a
-libraryDeps = select (== ComponentLib)
+libraryDeps = select (\c -> case c of ComponentLib _ -> True
+                                      _ -> False)
 
--- | Setup dependencies
+-- | Setup dependencies.
 setupDeps :: Monoid a => ComponentDeps a -> a
 setupDeps = select (== ComponentSetup)
 
--- | Select dependencies satisfying a given predicate
+-- | Select dependencies satisfying a given predicate.
 select :: Monoid a => (Component -> Bool) -> ComponentDeps a -> a
 select p = foldMap snd . filter (p . fst) . toList

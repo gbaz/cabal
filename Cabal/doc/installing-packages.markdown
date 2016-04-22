@@ -1,5 +1,140 @@
 % Cabal User Guide
 
+# Configuration #
+
+## Overview ##
+
+The global configuration file for `cabal-install` is `~/.cabal/config`. If you
+do not have this file, `cabal` will create it for you on the first call to
+`cabal update`. Alternatively, you can explicitly ask `cabal` to create it for
+you using
+
+> `cabal user-config update`
+
+Most of the options in this configuration file are also available as command
+line arguments, and the corresponding documentation can be used to lookup their
+meaning. The created configuration file only specifies values for a handful of
+options. Most options are left at their default value, which it documents;
+for instance,
+
+~~~~~~~~~~~~~~~~
+-- executable-stripping: True
+~~~~~~~~~~~~~~~~
+
+means that the configuration file currently does not specify a value for the
+`executable-stripping` option (the line is commented out), and that the default
+is `True`; if you wanted to disable stripping of executables by default, you
+would change this line to
+
+~~~~~~~~~~~~~~~~
+executable-stripping: False
+~~~~~~~~~~~~~~~~
+
+You can also use `cabal user-config update` to migrate configuration files
+created by older versions of `cabal`.
+
+## Repository specification ##
+
+An important part of the configuration if the specification of the repository.
+When `cabal` creates a default config file, it configures the repository to
+be the central Hackage server:
+
+~~~~~~~~~~~~~~~~
+repository hackage.haskell.org
+  url: http://hackage.haskell.org/
+~~~~~~~~~~~~~~~~
+
+The name of the repository is given on the first line, and can be anything;
+packages downloaded from this repository will be cached under
+`~/.cabal/packages/hackage.haskell.org` (or whatever name you specify; you can
+change the prefix by changing the value of `remote-repo-cache`). If you want,
+you can configure multiple repositories, and `cabal` will combine them and be
+able to download packages from any of them.
+
+### Using secure repositories ###
+
+For repositories that support the TUF security infrastructure (this includes
+Hackage), you can enable secure access to the repository by specifying:
+
+~~~~~~~~~~~~~~~~
+repository hackage.haskell.org
+  url: http://hackage.haskell.org/
+  secure: True
+  root-keys: <root-key-IDs>
+  key-threshold: <key-threshold>
+~~~~~~~~~~~~~~~~
+
+The `<root-key-IDs>` and `<key-threshold>` values are used for bootstrapping. As
+part of the TUF infrastructure the repository will contain a file `root.json`
+(for instance,
+[http://hackage.haskell.org/root.json](http://hackage.haskell.org/root.json))
+which the client needs to do verification. However, how  can `cabal` verify the
+`root.json` file _itself_? This is known as bootstrapping: if you specify a list
+of root key IDs and a corresponding  threshold, `cabal` will verify that the
+downloaded `root.json` file has been  signed with at least `<key-threshold>`
+keys from your set of `<root-key-IDs>`.
+
+You can, but are not recommended to, omit these two fields. In that case `cabal`
+will download the `root.json` field and use it without verification. Although
+this bootstrapping step is then unsafe, all subsequent access is secure
+(provided that the downloaded `root.json` was not tempered with). Of course,
+adding `root-keys` and `key-threshold` to your repository specification only
+shifts the problem, because now you somehow need to make sure that the key IDs
+you received were the right ones. How that is done is however outside the scope
+of `cabal` proper.
+
+More information about the security infrastructure can be found at
+[https://github.com/well-typed/hackage-security](https://github.com/well-typed/hackage-security).
+
+### Legacy repositories ###
+
+Currently `cabal` supports two kinds of &ldquo;legacy&rdquo; repositories. The
+first is specified using
+
+~~~~~~~~~~~~~~~~
+remote-repo: hackage.haskell.org:http://hackage.haskell.org/packages/archive
+~~~~~~~~~~~~~~~~
+
+This is just syntactic sugar for
+
+~~~~~~~~~~~~~~~~
+repository hackage.haskell.org
+  url: hackage.haskell.org:http://hackage.haskell.org/packages/archive
+~~~~~~~~~~~~~~~~
+
+although, in (and only in) the specific case of Hackage, the URL
+`http://hackage.haskell.org/packages/archive` will be silently translated to
+`http://hackage.haskell.org/`.
+
+The second kind of legacy repositories are so-called &ldquo;local&rdquo;
+repositories:
+
+~~~~~~~~~~~~~~~~
+local-repo: my-local-repo:/path/to/local/repo
+~~~~~~~~~~~~~~~~
+
+This can be used to access repositories on the local file system. However, the
+layout of these local repositories is different from the layout of remote
+repositories, and usage of these local repositories is deprecated.
+
+### Secure local repositories ###
+
+If you want to use repositories on your local file system, it is recommended
+instead to use a _secure_ local repository:
+
+~~~~~~~~~~~~~~~~
+repository my-local-repo
+  url: file:/path/to/local/repo
+  secure: True
+  root-keys: <root-key-IDs>
+  key-threshold: <key-threshold>
+~~~~~~~~~~~~~~~~
+
+The layout of these secure local repos matches the layout of remote repositories
+exactly; the
+[hackage-repo-tool](http://hackage.haskell.org/package/hackage-repo-tool) can be
+used to create and manage such repositories.
+
 # Building and installing packages #
 
 After you've unpacked a Cabal package, you can build it by moving into
@@ -610,6 +745,14 @@ be controlled with the following command line options.
     be a file or directory. Not all implementations support arbitrary
     package databases.
 
+`--default-user-config=` _file_
+:   Allows a "default" `cabal.config` freeze file to be passed in
+    manually. This file will only be used if one does not exist in the
+    project directory already. Typically, this can be set from the global
+    cabal `config` file so as to provide a default set of partial
+    constraints to be used by projects, providing a way for users to peg
+    themselves to stable package collections.
+
 `--enable-optimization`[=_n_] or `-O`[_n_]
 :   (default) Build with optimization flags (if available). This is
     appropriate for production use, taking more time to build faster
@@ -789,6 +932,10 @@ be controlled with the following command line options.
 :   An extra directory to search for system libraries files. You can use
     this flag multiple times to get a list of directories.
 
+`--extra-framework-dirs`[=_dir_]
+:   An extra directory to search for frameworks (OS X only). You can use this
+    flag multiple times to get a list of directories.
+
     You might need to use this flag if you have standard system
     libraries in a non-standard location that is not mentioned in the
     package's `.cabal` file. Using this option has the same affect as
@@ -835,8 +982,26 @@ be controlled with the following command line options.
     $ cabal install --allow-newer=bar --constraint="bar==2.1" foo
     ~~~~~~~~~~~~~~~~
 
-    It's also possible to enable `--allow-newer` permanently by setting
-    `allow-newer: True` in the `~/.cabal/config` file.
+    It's also possible to limit the scope of `--allow-newer` to single
+    packages with the `--allow-newer=scope:dep` syntax. This means that the
+    dependency on `dep` will be relaxed only for the package `scope`.
+
+    Example:
+
+    ~~~~~~~~~~~~~~~~
+    # Relax upper bound in foo's dependency on base; also relax upper bound in
+    # every package's dependency on lens.
+    $ cabal install --allow-newer=foo:base,lens
+
+    # Relax upper bounds in foo's dependency on base and bar's dependency
+    # on time; also relax the upper bound in the dependency on lens specified by
+    # any package.
+    $ cabal install --allow-newer=foo:base,lens --allow-newer=bar:time
+    ~~~~~~~~~~~~~~~~
+
+    Finally, one can enable `--allow-newer` permanently by setting `allow-newer:
+    True` in the `~/.cabal/config` file. Enabling 'allow-newer' selectively is
+    also supported in the config file (`allow-newer: foo, bar, baz:base`).
 
 `--constraint=`_constraint_
 :   Restrict solutions involving a package to a given version range.
@@ -995,7 +1160,8 @@ This command takes the following options:
 
 `--gen-pkg-config`[=_path_]
 :   Instead of registering the package, generate a package registration
-    file. This only applies to compilers that support package
+    file (or directory, in some circumstances).
+    This only applies to compilers that support package
     registration files which at the moment is only GHC. The file should
     be used with the compiler's mechanism for registering packages. This
     option is mainly intended for packaging systems. If possible use the
@@ -1004,6 +1170,11 @@ This command takes the following options:
     optional and can be used to specify a particular output file to
     generate. Otherwise, by default the file is the package name and
     version with a `.conf` extension.
+
+    This option outputs a directory if the package requires multiple
+    registrations: this can occur if internal/convenience libraries
+    are used.  These configuration file names are sorted so that they
+    can be registered in order.
 
 `--inplace`
 :   Registers the package for use directly from the build tree, without

@@ -28,8 +28,9 @@
 
 module Distribution.InstalledPackageInfo (
         InstalledPackageInfo(..),
-        libraryName,
-        OriginalModule(..), ExposedModule(..),
+        installedComponentId,
+        installedPackageId,
+        ExposedModule(..),
         ParseResult(..), PError(..), PWarning,
         emptyInstalledPackageInfo,
         parseInstalledPackageInfo,
@@ -40,43 +41,30 @@ module Distribution.InstalledPackageInfo (
   ) where
 
 import Distribution.ParseUtils
-         ( FieldDescr(..), ParseResult(..), PError(..), PWarning
-         , simpleField, listField, parseLicenseQ
-         , showFields, showSingleNamedField, showSimpleSingleNamedField
-         , parseFieldsFlat
-         , parseFilePathQ, parseTokenQ, parseModuleNameQ, parsePackageNameQ
-         , showFilePath, showToken, boolField, parseOptVersion
-         , parseFreeText, showFreeText, parseOptCommaList )
-import Distribution.License     ( License(..) )
-import Distribution.Package
-         ( PackageName(..), PackageIdentifier(..)
-         , PackageId, InstalledPackageId(..)
-         , packageName, packageVersion, PackageKey(..)
-         , LibraryName(..) )
+import Distribution.License
+import Distribution.Package hiding (installedUnitId, installedPackageId)
 import qualified Distribution.Package as Package
 import Distribution.ModuleName
-         ( ModuleName )
 import Distribution.Version
-         ( Version(..) )
 import Distribution.Text
-         ( Text(disp, parse) )
-import Text.PrettyPrint as Disp
 import qualified Distribution.Compat.ReadP as Parse
+import Distribution.Compat.Binary
 
-import Distribution.Compat.Binary  (Binary)
+import Text.PrettyPrint as Disp
 import Data.Maybe   (fromMaybe)
 import GHC.Generics (Generic)
 
 -- -----------------------------------------------------------------------------
 -- The InstalledPackageInfo type
 
-
+-- For BC reasons, we continue to name this record an InstalledPackageInfo;
+-- but it would more accurately be called an InstalledUnitInfo with Backpack
 data InstalledPackageInfo
    = InstalledPackageInfo {
         -- these parts are exactly the same as PackageDescription
-        installedPackageId :: InstalledPackageId,
-        sourcePackageId    :: PackageId,
-        packageKey         :: PackageKey,
+        sourcePackageId   :: PackageId,
+        installedUnitId   :: UnitId,
+        compatPackageKey  :: String,
         license           :: License,
         copyright         :: String,
         maintainer        :: String,
@@ -88,9 +76,9 @@ data InstalledPackageInfo
         description       :: String,
         category          :: String,
         -- these parts are required by an installed package only:
+        abiHash           :: AbiHash,
         exposed           :: Bool,
         exposedModules    :: [ExposedModule],
-        instantiatedWith  :: [(ModuleName, OriginalModule)],
         hiddenModules     :: [ModuleName],
         trusted           :: Bool,
         importDirs        :: [FilePath],
@@ -101,7 +89,7 @@ data InstalledPackageInfo
         extraGHCiLibraries:: [String],    -- overrides extraLibraries for GHCi
         includeDirs       :: [FilePath],
         includes          :: [String],
-        depends           :: [InstalledPackageId],
+        depends           :: [UnitId],
         ccOptions         :: [String],
         ldOptions         :: [String],
         frameworkDirs     :: [FilePath],
@@ -110,18 +98,24 @@ data InstalledPackageInfo
         haddockHTMLs      :: [FilePath],
         pkgRoot           :: Maybe FilePath
     }
-    deriving (Generic, Read, Show)
+    deriving (Eq, Generic, Read, Show)
 
-libraryName :: InstalledPackageInfo -> LibraryName
-libraryName ipi = Package.packageKeyLibraryName (sourcePackageId ipi) (packageKey ipi)
+installedComponentId :: InstalledPackageInfo -> ComponentId
+installedComponentId ipi = case installedUnitId ipi of
+                            SimpleUnitId cid -> cid
+
+{-# DEPRECATED installedPackageId "Use installedUnitId instead" #-}
+-- | Backwards compatibility with Cabal pre-1.24.
+installedPackageId :: InstalledPackageInfo -> UnitId
+installedPackageId = installedUnitId
 
 instance Binary InstalledPackageInfo
 
 instance Package.Package InstalledPackageInfo where
    packageId = sourcePackageId
 
-instance Package.HasInstalledPackageId InstalledPackageInfo where
-   installedPackageId = installedPackageId
+instance Package.HasUnitId InstalledPackageInfo where
+   installedUnitId = installedUnitId
 
 instance Package.PackageInstalled InstalledPackageInfo where
    installedDepends = depends
@@ -129,10 +123,9 @@ instance Package.PackageInstalled InstalledPackageInfo where
 emptyInstalledPackageInfo :: InstalledPackageInfo
 emptyInstalledPackageInfo
    = InstalledPackageInfo {
-        installedPackageId = InstalledPackageId "",
-        sourcePackageId    = PackageIdentifier (PackageName "") noVersion,
-        packageKey         = OldPackageKey (PackageIdentifier
-                                               (PackageName "") noVersion),
+        sourcePackageId   = PackageIdentifier (PackageName "") (Version [] []),
+        installedUnitId   = mkUnitId "",
+        compatPackageKey  = "",
         license           = UnspecifiedLicense,
         copyright         = "",
         maintainer        = "",
@@ -143,10 +136,10 @@ emptyInstalledPackageInfo
         synopsis          = "",
         description       = "",
         category          = "",
+        abiHash           = AbiHash "",
         exposed           = False,
         exposedModules    = [],
         hiddenModules     = [],
-        instantiatedWith  = [],
         trusted           = False,
         importDirs        = [],
         libraryDirs       = [],
@@ -166,44 +159,21 @@ emptyInstalledPackageInfo
         pkgRoot           = Nothing
     }
 
-noVersion :: Version
-noVersion = Version [] []
-
 -- -----------------------------------------------------------------------------
 -- Exposed modules
-
-data OriginalModule
-   = OriginalModule {
-       originalPackageId :: InstalledPackageId,
-       originalModuleName :: ModuleName
-     }
-  deriving (Generic, Eq, Read, Show)
 
 data ExposedModule
    = ExposedModule {
        exposedName      :: ModuleName,
-       exposedReexport  :: Maybe OriginalModule,
-       exposedSignature :: Maybe OriginalModule -- This field is unused for now.
+       exposedReexport  :: Maybe Module
      }
-  deriving (Generic, Read, Show)
-
-instance Text OriginalModule where
-    disp (OriginalModule ipi m) =
-        disp ipi <> Disp.char ':' <> disp m
-    parse = do
-        ipi <- parse
-        _ <- Parse.char ':'
-        m <- parse
-        return (OriginalModule ipi m)
+  deriving (Eq, Generic, Read, Show)
 
 instance Text ExposedModule where
-    disp (ExposedModule m reexport signature) =
+    disp (ExposedModule m reexport) =
         Disp.sep [ disp m
                  , case reexport of
                     Just m' -> Disp.sep [Disp.text "from", disp m']
-                    Nothing -> Disp.empty
-                 , case signature of
-                    Just m' -> Disp.sep [Disp.text "is", disp m']
                     Nothing -> Disp.empty
                  ]
     parse = do
@@ -213,15 +183,8 @@ instance Text ExposedModule where
             _ <- Parse.string "from"
             Parse.skipSpaces
             fmap Just parse
-        Parse.skipSpaces
-        signature <- Parse.option Nothing $ do
-            _ <- Parse.string "is"
-            Parse.skipSpaces
-            fmap Just parse
-        return (ExposedModule m reexport signature)
+        return (ExposedModule m reexport)
 
-
-instance Binary OriginalModule
 
 instance Binary ExposedModule
 
@@ -234,7 +197,7 @@ showExposedModules :: [ExposedModule] -> Disp.Doc
 showExposedModules xs
     | all isExposedModule xs = fsep (map disp xs)
     | otherwise = fsep (Disp.punctuate comma (map disp xs))
-    where isExposedModule (ExposedModule _ Nothing Nothing) = True
+    where isExposedModule (ExposedModule _ Nothing) = True
           isExposedModule _ = False
 
 parseExposedModules :: Parse.ReadP r [ExposedModule]
@@ -248,14 +211,6 @@ parseInstalledPackageInfo =
     parseFieldsFlat (fieldsInstalledPackageInfo ++ deprecatedFieldDescrs)
     emptyInstalledPackageInfo
 
-parseInstantiatedWith :: Parse.ReadP r (ModuleName, OriginalModule)
-parseInstantiatedWith = do k <- parse
-                           _ <- Parse.char '='
-                           n <- parse
-                           _ <- Parse.char '@'
-                           p <- parse
-                           return (k, OriginalModule p n)
-
 -- -----------------------------------------------------------------------------
 -- Pretty-printing
 
@@ -267,9 +222,6 @@ showInstalledPackageInfoField = showSingleNamedField fieldsInstalledPackageInfo
 
 showSimpleInstalledPackageInfoField :: String -> Maybe (InstalledPackageInfo -> String)
 showSimpleInstalledPackageInfoField = showSimpleSingleNamedField fieldsInstalledPackageInfo
-
-showInstantiatedWith :: (ModuleName, OriginalModule) -> Doc
-showInstantiatedWith (k, OriginalModule p m) = disp k <> text "=" <> disp m <> text "@" <> disp p
 
 -- -----------------------------------------------------------------------------
 -- Description of the fields, for parsing/printing
@@ -287,10 +239,11 @@ basicFieldDescrs =
                            packageVersion         (\ver pkg -> pkg{sourcePackageId=(sourcePackageId pkg){pkgVersion=ver}})
  , simpleField "id"
                            disp                   parse
-                           installedPackageId     (\ipid pkg -> pkg{installedPackageId=ipid})
+                           installedUnitId             (\pk pkg -> pkg{installedUnitId=pk})
+ -- NB: parse these as component IDs
  , simpleField "key"
-                           disp                   parse
-                           packageKey             (\pk pkg -> pkg{packageKey=pk})
+                           (disp . ComponentId)   (fmap (\(ComponentId s) -> s) parse)
+                           compatPackageKey       (\pk pkg -> pkg{compatPackageKey=pk})
  , simpleField "license"
                            disp                   parseLicenseQ
                            license                (\l pkg -> pkg{license=l})
@@ -333,9 +286,9 @@ installedFieldDescrs = [
  , listField   "hidden-modules"
         disp               parseModuleNameQ
         hiddenModules      (\xs    pkg -> pkg{hiddenModules=xs})
- , listField   "instantiated-with"
-        showInstantiatedWith parseInstantiatedWith
-        instantiatedWith   (\xs    pkg -> pkg{instantiatedWith=xs})
+ , simpleField "abi"
+        disp               parse
+        abiHash            (\abi    pkg -> pkg{abiHash=abi})
  , boolField   "trusted"
         trusted            (\val pkg -> pkg{trusted=val})
  , listField   "import-dirs"

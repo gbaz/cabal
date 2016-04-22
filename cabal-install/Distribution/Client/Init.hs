@@ -18,6 +18,8 @@ module Distribution.Client.Init (
 
     -- * Commands
     initCabal
+  , pvpize
+  , incVersion
 
   ) where
 
@@ -98,19 +100,21 @@ import Distribution.Client.PackageIndex
 import Distribution.Client.IndexUtils
   ( getSourcePackages )
 import Distribution.Client.Types
-  ( SourcePackageDb(..), Repo )
+  ( SourcePackageDb(..) )
+import Distribution.Client.Setup
+  ( RepoContext(..) )
 
 initCabal :: Verbosity
           -> PackageDBStack
-          -> [Repo]
+          -> RepoContext
           -> Compiler
           -> ProgramConfiguration
           -> InitFlags
           -> IO ()
-initCabal verbosity packageDBs repos comp conf initFlags = do
+initCabal verbosity packageDBs repoCtxt comp conf initFlags = do
 
   installedPkgIndex <- getInstalledPackages verbosity comp packageDBs conf
-  sourcePkgDb <- getSourcePackages verbosity repos
+  sourcePkgDb <- getSourcePackages verbosity repoCtxt
 
   hSetBuffering stdout NoBuffering
 
@@ -359,7 +363,7 @@ getSrcDir :: InitFlags -> IO InitFlags
 getSrcDir flags = do
   srcDirs <- return (sourceDirs flags)
              ?>> fmap (:[]) `fmap` guessSourceDir flags
-             ?>> fmap (fmap ((:[]) . either id id) . join) (maybePrompt
+             ?>> fmap (>>= fmap ((:[]) . either id id)) (maybePrompt
                       flags
                       (promptListOptional' "Source directory" ["src"] id))
 
@@ -465,12 +469,17 @@ chooseDep flags (m, Just ps)
       return $ P.Dependency (P.pkgName . head $ pids)
                             (pvpize . maximum . map P.pkgVersion $ pids)
 
-    pvpize :: Version -> VersionRange
-    pvpize v = orLaterVersion v'
-               `intersectVersionRanges`
-               earlierVersion (incVersion 1 v')
-      where v' = (v { versionBranch = take 2 (versionBranch v) })
+-- | Given a version, return an API-compatible (according to PVP) version range.
+--
+-- Example: @0.4.1@ produces the version range @>= 0.4 && < 0.5@ (which is the
+-- same as @0.4.*@).
+pvpize :: Version -> VersionRange
+pvpize v = orLaterVersion v'
+           `intersectVersionRanges`
+           earlierVersion (incVersion 1 v')
+  where v' = (v { versionBranch = take 2 (versionBranch v) })
 
+-- | Increment the nth version component (counting from 0).
 incVersion :: Int -> Version -> Version
 incVersion n (Version vlist tags) = Version (incVersion' n vlist) tags
   where

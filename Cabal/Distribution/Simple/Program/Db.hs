@@ -1,6 +1,3 @@
-{-# LANGUAGE CPP #-}
-{-# LANGUAGE DeriveGeneric #-}
-
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.Simple.Program.Db
@@ -59,29 +56,19 @@ module Distribution.Simple.Program.Db (
   ) where
 
 import Distribution.Simple.Program.Types
-         ( Program(..), ProgArg, ConfiguredProgram(..), ProgramLocation(..) )
 import Distribution.Simple.Program.Find
-         ( ProgramSearchPath, defaultProgramSearchPath
-         , findProgramOnSearchPath, programSearchPathAsPATHVar )
 import Distribution.Simple.Program.Builtin
-         ( builtinPrograms )
 import Distribution.Simple.Utils
-         ( die, doesExecutableExist )
 import Distribution.Version
-         ( Version, VersionRange, isAnyVersion, withinRange )
 import Distribution.Text
-         ( display )
 import Distribution.Verbosity
-         ( Verbosity )
+import Distribution.Compat.Binary
 
-import Distribution.Compat.Binary (Binary(..))
-#if __GLASGOW_HASKELL__ < 710
-import Data.Functor ((<$>))
-#endif
 import Data.List
          ( foldl' )
 import Data.Maybe
          ( catMaybes )
+import Data.Tuple (swap)
 import qualified Data.Map as Map
 import Control.Monad
          ( join, foldM )
@@ -129,28 +116,42 @@ updateConfiguredProgs update conf =
 
 
 -- Read & Show instances are based on listToFM
--- Note that we only serialise the configured part of the database, this is
--- because we don't need the unconfigured part after the configure stage, and
--- additionally because we cannot read/show 'Program' as it contains functions.
+
+-- | Note that this instance does not preserve the known 'Program's.
+-- See 'restoreProgramDb' for details.
+--
 instance Show ProgramDb where
   show = show . Map.toAscList . configuredProgs
 
+-- | Note that this instance does not preserve the known 'Program's.
+-- See 'restoreProgramDb' for details.
+--
 instance Read ProgramDb where
   readsPrec p s =
     [ (emptyProgramDb { configuredProgs = Map.fromList s' }, r)
     | (s', r) <- readsPrec p s ]
 
+-- | Note that this instance does not preserve the known 'Program's.
+-- See 'restoreProgramDb' for details.
+--
 instance Binary ProgramDb where
-  put = put . configuredProgs
+  put db = do
+    put (progSearchPath db)
+    put (configuredProgs db)
+
   get = do
-      progs <- get
-      return $! emptyProgramDb { configuredProgs = progs }
+    searchpath <- get
+    progs      <- get
+    return $! emptyProgramDb {
+      progSearchPath  = searchpath,
+      configuredProgs = progs
+    }
 
 
--- | The Read\/Show instance does not preserve all the unconfigured 'Programs'
--- because 'Program' is not in Read\/Show because it contains functions. So to
--- fully restore a deserialised 'ProgramDb' use this function to add
--- back all the known 'Program's.
+-- | The 'Read'\/'Show' and 'Binary' instances do not preserve all the
+-- unconfigured 'Programs' because 'Program' is not in 'Read'\/'Show' because
+-- it contains functions. So to fully restore a deserialised 'ProgramDb' use
+-- this function to add back all the known 'Program's.
 --
 -- * It does not add the default programs, but you probably want them, use
 --   'builtinPrograms' in addition to any extra you might need.
@@ -319,21 +320,23 @@ configureProgram :: Verbosity
 configureProgram verbosity prog conf = do
   let name = programName prog
   maybeLocation <- case userSpecifiedPath prog conf of
-    Nothing   -> programFindLocation prog verbosity (progSearchPath conf)
-             >>= return . fmap FoundOnSystem
+    Nothing   ->
+      programFindLocation prog verbosity (progSearchPath conf)
+      >>= return . fmap (swap . fmap FoundOnSystem . swap)
     Just path -> do
       absolute <- doesExecutableExist path
       if absolute
-        then return (Just (UserSpecified path))
+        then return (Just (UserSpecified path, []))
         else findProgramOnSearchPath verbosity (progSearchPath conf) path
-         >>= maybe (die notFound) (return . Just . UserSpecified)
+             >>= maybe (die notFound)
+                       (return . Just . swap . fmap UserSpecified . swap)
       where notFound = "Cannot find the program '" ++ name
                      ++ "'. User-specified path '"
                      ++ path ++ "' does not refer to an executable and "
                      ++ "the program is not on the system path."
   case maybeLocation of
     Nothing -> return conf
-    Just location -> do
+    Just (location, triedLocations) -> do
       version <- programFindVersion prog verbosity (locationPath location)
       newPath <- programSearchPathAsPATHVar (progSearchPath conf)
       let configuredProg        = ConfiguredProgram {
@@ -343,7 +346,8 @@ configureProgram verbosity prog conf = do
             programOverrideArgs = userSpecifiedArgs prog conf,
             programOverrideEnv  = [("PATH", Just newPath)],
             programProperties   = Map.empty,
-            programLocation     = location
+            programLocation     = location,
+            programMonitorFiles = triedLocations
           }
       configuredProg' <- programPostConf prog verbosity configuredProg
       return (updateConfiguredProgs (Map.insert name configuredProg') conf)
@@ -443,7 +447,7 @@ lookupProgramVersion verbosity prog range programDb = do
           | otherwise                 ->
             return $! Left (badVersion version location)
         Nothing                       ->
-          return $! Left (noVersion location)
+          return $! Left (unknownVersion location)
 
   where notFound       = "The program '"
                       ++ programName prog ++ "'" ++ versionRequirement
@@ -452,7 +456,7 @@ lookupProgramVersion verbosity prog range programDb = do
                       ++ programName prog ++ "'" ++ versionRequirement
                       ++ " is required but the version found at "
                       ++ locationPath l ++ " is version " ++ display v
-        noVersion l    = "The program '"
+        unknownVersion l = "The program '"
                       ++ programName prog ++ "'" ++ versionRequirement
                       ++ " is required but the version of "
                       ++ locationPath l ++ " could not be determined."
@@ -467,5 +471,5 @@ requireProgramVersion :: Verbosity -> Program -> VersionRange
                       -> ProgramDb
                       -> IO (ConfiguredProgram, Version, ProgramDb)
 requireProgramVersion verbosity prog range programDb =
-  join $ either die return <$>
+  join $ either die return `fmap`
   lookupProgramVersion verbosity prog range programDb

@@ -1,4 +1,6 @@
 {-# LANGUAGE CPP #-}
+{-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE DeriveGeneric #-}
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.Client.Targets
@@ -42,7 +44,9 @@ module Distribution.Client.Targets (
   UserConstraint(..),
   userConstraintPackageName,
   readUserConstraint,
-  userToPackageConstraint
+  userToPackageConstraint,
+  dispFlagAssignment,
+  parseFlagAssignment,
 
   ) where
 
@@ -51,7 +55,8 @@ import Distribution.Package
          , PackageIdentifier(..), packageName, packageVersion
          , Dependency(Dependency) )
 import Distribution.Client.Types
-         ( SourcePackage(..), PackageLocation(..), OptionalStanza(..) )
+         ( SourcePackage(..), PackageLocation(..), OptionalStanza(..)
+         , ResolvedPkgLoc, UnresolvedSourcePackage )
 import Distribution.Client.Dependency.Types
          ( PackageConstraint(..), ConstraintSource(..)
          , LabeledPackageConstraint(..) )
@@ -59,10 +64,13 @@ import Distribution.Client.Dependency.Types
 import qualified Distribution.Client.World as World
 import Distribution.Client.PackageIndex (PackageIndex)
 import qualified Distribution.Client.PackageIndex as PackageIndex
+import qualified Codec.Archive.Tar       as Tar
+import qualified Codec.Archive.Tar.Entry as Tar
 import qualified Distribution.Client.Tar as Tar
 import Distribution.Client.FetchUtils
-import Distribution.Client.HttpUtils ( HttpTransport(..) )
 import Distribution.Client.Utils ( tryFindPackageDesc )
+import Distribution.Client.GlobalFlags
+         ( RepoContext(..) )
 
 import Distribution.PackageDescription
          ( GenericPackageDescription, FlagName(..), FlagAssignment )
@@ -95,6 +103,8 @@ import Control.Monad (liftM)
 import qualified Distribution.Compat.ReadP as Parse
 import Distribution.Compat.ReadP
          ( (+++), (<++) )
+import qualified Distribution.Compat.Semigroup as Semi
+         ( Semigroup((<>)) )
 import qualified Text.PrettyPrint as Disp
 import Text.PrettyPrint
          ( (<>), (<+>) )
@@ -106,6 +116,8 @@ import System.Directory
          ( doesFileExist, doesDirectoryExist )
 import Network.URI
          ( URI(..), URIAuth(..), parseAbsoluteURI )
+import GHC.Generics (Generic)
+import Distribution.Compat.Binary (Binary)
 
 -- ------------------------------------------------------------
 -- * User targets
@@ -182,7 +194,9 @@ data PackageSpecifier pkg =
      -- | A fully specified source package.
      --
    | SpecificSourcePackage pkg
-  deriving Show
+  deriving (Eq, Show, Generic)
+
+instance Binary pkg => Binary (PackageSpecifier pkg)
 
 pkgSpecifierTarget :: Package pkg => PackageSpecifier pkg -> PackageName
 pkgSpecifierTarget (NamedPackage name _)       = name
@@ -357,17 +371,17 @@ reportUserTargetProblems problems = do
 --
 resolveUserTargets :: Package pkg
                    => Verbosity
-                   -> HttpTransport
+                   -> RepoContext
                    -> FilePath
                    -> PackageIndex pkg
                    -> [UserTarget]
-                   -> IO [PackageSpecifier SourcePackage]
-resolveUserTargets verbosity transport worldFile available userTargets = do
+                   -> IO [PackageSpecifier UnresolvedSourcePackage]
+resolveUserTargets verbosity repoCtxt worldFile available userTargets = do
 
     -- given the user targets, get a list of fully or partially resolved
     -- package references
     packageTargets <- mapM (readPackageTarget verbosity)
-                  =<< mapM (fetchPackageTarget transport verbosity) . concat
+                  =<< mapM (fetchPackageTarget verbosity repoCtxt) . concat
                   =<< mapM (expandUserTarget worldFile) userTargets
 
     -- users are allowed to give package names case-insensitively, so we must
@@ -453,15 +467,15 @@ localPackageError dir =
 
 -- | Fetch any remote targets so that they can be read.
 --
-fetchPackageTarget :: HttpTransport
-                   -> Verbosity
+fetchPackageTarget :: Verbosity
+                   -> RepoContext
                    -> PackageTarget (PackageLocation ())
-                   -> IO (PackageTarget (PackageLocation FilePath))
-fetchPackageTarget transport verbosity target = case target of
+                   -> IO (PackageTarget ResolvedPkgLoc)
+fetchPackageTarget verbosity repoCtxt target = case target of
     PackageTargetNamed      n cs ut -> return (PackageTargetNamed      n cs ut)
     PackageTargetNamedFuzzy n cs ut -> return (PackageTargetNamedFuzzy n cs ut)
     PackageTargetLocation location  -> do
-      location' <- fetchPackage transport verbosity (fmap (const Nothing) location)
+      location' <- fetchPackage verbosity repoCtxt (fmap (const Nothing) location)
       return (PackageTargetLocation location')
 
 
@@ -470,8 +484,8 @@ fetchPackageTarget transport verbosity target = case target of
 -- This only affects targets given by location, named targets are unaffected.
 --
 readPackageTarget :: Verbosity
-                  -> PackageTarget (PackageLocation FilePath)
-                  -> IO (PackageTarget SourcePackage)
+                  -> PackageTarget ResolvedPkgLoc
+                  -> IO (PackageTarget UnresolvedSourcePackage)
 readPackageTarget verbosity target = case target of
 
     PackageTargetNamed pkgname constraints userTarget ->
@@ -524,7 +538,7 @@ readPackageTarget verbosity target = case target of
     extractTarballPackageCabalFile tarballFile tarballOriginalLoc =
           either (die . formatErr) return
         . check
-        . Tar.entriesIndex
+        . accumEntryMap
         . Tar.filterEntries isCabalFile
         . Tar.read
         . GZipUtils.maybeDecompress
@@ -532,7 +546,11 @@ readPackageTarget verbosity target = case target of
       where
         formatErr msg = "Error reading " ++ tarballOriginalLoc ++ ": " ++ msg
 
-        check (Left e)  = Left e
+        accumEntryMap = Tar.foldlEntries
+                          (\m e -> Map.insert (Tar.entryTarPath e) e m)
+                          Map.empty
+
+        check (Left e)  = Left (show e)
         check (Right m) = case Map.elems m of
             []     -> Left noCabalFile
             [file] -> case Tar.entryContent file of
@@ -662,7 +680,10 @@ newtype PackageNameEnv = PackageNameEnv (PackageName -> [PackageName])
 
 instance Monoid PackageNameEnv where
   mempty = PackageNameEnv (const [])
-  mappend (PackageNameEnv lookupA) (PackageNameEnv lookupB) =
+  mappend = (Semi.<>)
+
+instance Semi.Semigroup PackageNameEnv where
+  PackageNameEnv lookupA <> PackageNameEnv lookupB =
     PackageNameEnv (\name -> lookupA name ++ lookupB name)
 
 indexPackageNameEnv :: PackageIndex pkg -> PackageNameEnv
@@ -691,7 +712,9 @@ data UserConstraint =
    | UserConstraintSource    PackageName
    | UserConstraintFlags     PackageName FlagAssignment
    | UserConstraintStanzas   PackageName [OptionalStanza]
-  deriving (Show,Eq)
+  deriving (Eq, Show, Generic)
+
+instance Binary UserConstraint
 
 userConstraintPackageName :: UserConstraint -> PackageName
 userConstraintPackageName uc = case uc of
@@ -728,7 +751,6 @@ readUserConstraint str =
          "expected a package name followed by a constraint, which is "
       ++ "either a version range, 'installed', 'source' or flags"
 
---FIXME: use Text instance for FlagName and FlagAssignment
 instance Text UserConstraint where
   disp (UserConstraintVersion   pkgname verrange) = disp pkgname
                                                     <+> disp verrange
@@ -738,12 +760,6 @@ instance Text UserConstraint where
                                                     <+> Disp.text "source"
   disp (UserConstraintFlags     pkgname flags)    = disp pkgname
                                                     <+> dispFlagAssignment flags
-    where
-      dispFlagAssignment = Disp.hsep . map dispFlagValue
-      dispFlagValue (f, True)   = Disp.char '+' <> dispFlagName f
-      dispFlagValue (f, False)  = Disp.char '-' <> dispFlagName f
-      dispFlagName (FlagName f) = Disp.text f
-
   disp (UserConstraintStanzas   pkgname stanzas)  = disp pkgname
                                                     <+> dispStanzas stanzas
     where
@@ -753,37 +769,51 @@ instance Text UserConstraint where
 
   parse = parse >>= parseConstraint
     where
-      spaces = Parse.satisfy isSpace >> Parse.skipSpaces
-
       parseConstraint pkgname =
             ((parse >>= return . UserConstraintVersion pkgname)
-        +++ (do spaces
+        +++ (do skipSpaces1
                 _ <- Parse.string "installed"
                 return (UserConstraintInstalled pkgname))
-        +++ (do spaces
+        +++ (do skipSpaces1
                 _ <- Parse.string "source"
                 return (UserConstraintSource pkgname))
-        +++ (do spaces
+        +++ (do skipSpaces1
                 _ <- Parse.string "test"
                 return (UserConstraintStanzas pkgname [TestStanzas]))
-        +++ (do spaces
+        +++ (do skipSpaces1
                 _ <- Parse.string "bench"
                 return (UserConstraintStanzas pkgname [BenchStanzas])))
-        <++ (parseFlagAssignment >>= (return . UserConstraintFlags pkgname))
+        <++ (do skipSpaces1
+                flags <- parseFlagAssignment
+                return (UserConstraintFlags pkgname flags))
 
-      parseFlagAssignment = Parse.many1 (spaces >> parseFlagValue)
-      parseFlagValue =
-            (do Parse.optional (Parse.char '+')
-                f <- parseFlagName
-                return (f, True))
-        +++ (do _ <- Parse.char '-'
-                f <- parseFlagName
-                return (f, False))
-      parseFlagName = liftM FlagName ident
+--TODO: [code cleanup] move these somewhere else
+dispFlagAssignment :: FlagAssignment -> Disp.Doc
+dispFlagAssignment = Disp.hsep . map dispFlagValue
+  where
+    dispFlagValue (f, True)   = Disp.char '+' <> dispFlagName f
+    dispFlagValue (f, False)  = Disp.char '-' <> dispFlagName f
+    dispFlagName (FlagName f) = Disp.text f
 
-      ident :: Parse.ReadP r String
-      ident = Parse.munch1 identChar >>= \s -> check s >> return s
-        where
-          identChar c   = isAlphaNum c || c == '_' || c == '-'
-          check ('-':_) = Parse.pfail
-          check _       = return ()
+parseFlagAssignment :: Parse.ReadP r FlagAssignment
+parseFlagAssignment = Parse.sepBy1 parseFlagValue skipSpaces1
+  where
+    parseFlagValue =
+          (do Parse.optional (Parse.char '+')
+              f <- parseFlagName
+              return (f, True))
+      +++ (do _ <- Parse.char '-'
+              f <- parseFlagName
+              return (f, False))
+    parseFlagName = liftM (FlagName . lowercase) ident
+
+    ident :: Parse.ReadP r String
+    ident = Parse.munch1 identChar >>= \s -> check s >> return s
+      where
+        identChar c   = isAlphaNum c || c == '_' || c == '-'
+        check ('-':_) = Parse.pfail
+        check _       = return ()
+
+skipSpaces1 :: Parse.ReadP r ()
+skipSpaces1 = Parse.satisfy isSpace >> Parse.skipSpaces
+

@@ -14,8 +14,8 @@
 module Distribution.Client.Dependency.TopDown.Types where
 
 import Distribution.Client.Types
-         ( SourcePackage(..), ConfiguredPackage(..)
-         , OptionalStanza, ConfiguredId(..) )
+         ( UnresolvedPkgLoc, UnresolvedSourcePackage
+         , OptionalStanza, SolverPackage(..), SolverId(..) )
 import Distribution.InstalledPackageInfo
          ( InstalledPackageInfo )
 import qualified Distribution.Client.ComponentDeps as CD
@@ -44,7 +44,7 @@ data InstalledOrSource installed source
 
 data FinalSelectedPackage
    = SelectedInstalled InstalledPackage
-   | SelectedSource    ConfiguredPackage
+   | SelectedSource    (SolverPackage UnresolvedPkgLoc)
 
 type TopologicalSortNumber = Int
 
@@ -62,18 +62,19 @@ data InstalledPackageEx
 
 data UnconfiguredPackage
    = UnconfiguredPackage
-       SourcePackage
+       UnresolvedSourcePackage
        !TopologicalSortNumber
        FlagAssignment
        [OptionalStanza]
 
+-- | This is a minor misnomer: it's more of a 'SemiSolverPackage'.
 data SemiConfiguredPackage
    = SemiConfiguredPackage
-       SourcePackage     -- package info
-       FlagAssignment    -- total flag assignment for the package
-       [OptionalStanza]  -- enabled optional stanzas
-       [Dependency]      -- dependencies we end up with when we apply
-                         -- the flag assignment
+       UnresolvedSourcePackage           -- package info
+       FlagAssignment                    -- total flag assignment for the package
+       [OptionalStanza]                  -- enabled optional stanzas
+       [Dependency]                      -- dependencies we end up with when we apply
+                                         -- the flag assignment
 
 instance Package InstalledPackage where
   packageId (InstalledPackage pkg _) = packageId pkg
@@ -113,9 +114,9 @@ data InstalledConstraint = InstalledConstraint
 --
 -- The top-down solver uses its down type class for package dependencies,
 -- because it wants to know these dependencies as PackageIds, rather than as
--- InstalledPackageIds (so it cannot use PackageFixedDeps).
+-- ComponentIds (so it cannot use PackageFixedDeps).
 --
--- Ideally we would switch the top-down solver over to use InstalledPackageIds
+-- Ideally we would switch the top-down solver over to use ComponentIds
 -- throughout; that means getting rid of this type class, and changing over the
 -- package index type to use Cabal's rather than cabal-install's. That will
 -- avoid the need for the local definitions of dependencyGraph and
@@ -131,8 +132,8 @@ class Package a => PackageSourceDeps a where
 instance PackageSourceDeps InstalledPackageEx where
   sourceDeps (InstalledPackageEx _ _ deps) = deps
 
-instance PackageSourceDeps ConfiguredPackage where
-  sourceDeps (ConfiguredPackage _ _ _ deps) = map confSrcId $ CD.nonSetupDeps deps
+instance PackageSourceDeps (SolverPackage loc) where
+  sourceDeps pkg = map solverSrcId $ CD.nonSetupDeps (solverPkgDeps pkg)
 
 instance PackageSourceDeps InstalledPackage where
   sourceDeps (InstalledPackage _ deps) = deps

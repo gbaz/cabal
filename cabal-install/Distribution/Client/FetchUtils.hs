@@ -11,6 +11,7 @@
 --
 -- Functions for fetching packages
 -----------------------------------------------------------------------------
+{-# LANGUAGE RecordWildCards #-}
 module Distribution.Client.FetchUtils (
 
     -- * fetching packages
@@ -38,6 +39,8 @@ import Distribution.Text
          ( display )
 import Distribution.Verbosity
          ( Verbosity )
+import Distribution.Client.GlobalFlags
+         ( RepoContext(..) )
 
 import Data.Maybe
 import System.Directory
@@ -51,6 +54,8 @@ import qualified System.FilePath.Posix as FilePath.Posix
 import Network.URI
          ( URI(uriPath) )
 
+import qualified Hackage.Security.Client as Sec
+
 -- ------------------------------------------------------------
 -- * Actually fetch things
 -- ------------------------------------------------------------
@@ -58,7 +63,7 @@ import Network.URI
 -- | Returns @True@ if the package has already been fetched
 -- or does not need fetching.
 --
-isFetched :: PackageLocation (Maybe FilePath) -> IO Bool
+isFetched :: UnresolvedPkgLoc -> IO Bool
 isFetched loc = case loc of
     LocalUnpackedPackage _dir       -> return True
     LocalTarballPackage  _file      -> return True
@@ -66,8 +71,8 @@ isFetched loc = case loc of
     RepoTarballPackage repo pkgid _ -> doesFileExist (packageFile repo pkgid)
 
 
-checkFetched :: PackageLocation (Maybe FilePath)
-             -> IO (Maybe (PackageLocation FilePath))
+checkFetched :: UnresolvedPkgLoc
+             -> IO (Maybe ResolvedPkgLoc)
 checkFetched loc = case loc of
     LocalUnpackedPackage dir  ->
       return (Just $ LocalUnpackedPackage dir)
@@ -89,11 +94,11 @@ checkFetched loc = case loc of
 
 -- | Fetch a package if we don't have it already.
 --
-fetchPackage :: HttpTransport
-             -> Verbosity
-             -> PackageLocation (Maybe FilePath)
-             -> IO (PackageLocation FilePath)
-fetchPackage transport verbosity loc = case loc of
+fetchPackage :: Verbosity
+             -> RepoContext
+             -> UnresolvedPkgLoc
+             -> IO ResolvedPkgLoc
+fetchPackage verbosity repoCtxt loc = case loc of
     LocalUnpackedPackage dir  ->
       return (LocalUnpackedPackage dir)
     LocalTarballPackage  file ->
@@ -107,10 +112,11 @@ fetchPackage transport verbosity loc = case loc of
       path <- downloadTarballPackage uri
       return (RemoteTarballPackage uri path)
     RepoTarballPackage repo pkgid Nothing -> do
-      local <- fetchRepoTarball transport verbosity repo pkgid
+      local <- fetchRepoTarball verbosity repoCtxt repo pkgid
       return (RepoTarballPackage repo pkgid local)
   where
     downloadTarballPackage uri = do
+      transport <- repoContextGetTransport repoCtxt
       transportCheckHttps transport uri
       notice verbosity ("Downloading " ++ show uri)
       tmpdir <- getTemporaryDirectory
@@ -122,8 +128,8 @@ fetchPackage transport verbosity loc = case loc of
 
 -- | Fetch a repo package if we don't have it already.
 --
-fetchRepoTarball :: HttpTransport -> Verbosity -> Repo -> PackageId -> IO FilePath
-fetchRepoTarball transport verbosity repo pkgid = do
+fetchRepoTarball :: Verbosity -> RepoContext -> Repo -> PackageId -> IO FilePath
+fetchRepoTarball verbosity repoCtxt repo pkgid = do
   fetched <- doesFileExist (packageFile repo pkgid)
   if fetched
     then do info verbosity $ display pkgid ++ " has already been downloaded."
@@ -131,16 +137,26 @@ fetchRepoTarball transport verbosity repo pkgid = do
     else do setupMessage verbosity "Downloading" pkgid
             downloadRepoPackage
   where
-    downloadRepoPackage = case repoKind repo of
-      Right LocalRepo -> return (packageFile repo pkgid)
+    downloadRepoPackage = case repo of
+      RepoLocal{..} -> return (packageFile repo pkgid)
 
-      Left remoteRepo -> do
-        remoteRepoCheckHttps transport remoteRepo
-        let uri  = packageURI remoteRepo pkgid
-            dir  = packageDir       repo pkgid
-            path = packageFile      repo pkgid
+      RepoRemote{..} -> do
+        transport <- repoContextGetTransport repoCtxt
+        remoteRepoCheckHttps transport repoRemote
+        let uri  = packageURI  repoRemote pkgid
+            dir  = packageDir  repo       pkgid
+            path = packageFile repo       pkgid
         createDirectoryIfMissing True dir
         _ <- downloadURI transport verbosity uri path
+        return path
+
+      RepoSecure{} -> repoContextWithSecureRepo repoCtxt repo $ \rep -> do
+        let dir  = packageDir  repo pkgid
+            path = packageFile repo pkgid
+        createDirectoryIfMissing True dir
+        Sec.uncheckClientErrors $ do
+          info verbosity ("writing " ++ path)
+          Sec.downloadPackage' rep pkgid path
         return path
 
 -- | Downloads an index file to [config-dir/packages/serv-id].

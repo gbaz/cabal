@@ -1,5 +1,19 @@
 {-# LANGUAGE DeriveFunctor, DeriveFoldable, DeriveTraversable #-}
-module Distribution.Client.Dependency.Modular.Tree where
+module Distribution.Client.Dependency.Modular.Tree
+    ( FailReason(..)
+    , POption(..)
+    , Tree(..)
+    , TreeF(..)
+    , ana
+    , cata
+    , choices
+    , dchoices
+    , inn
+    , innM
+    , para
+    , trav
+    , zeroOrOneChoices
+    ) where
 
 import Control.Monad hiding (mapM, sequence)
 import Data.Foldable
@@ -9,7 +23,8 @@ import Prelude hiding (foldr, mapM, sequence)
 import Distribution.Client.Dependency.Modular.Dependency
 import Distribution.Client.Dependency.Modular.Flag
 import Distribution.Client.Dependency.Modular.Package
-import Distribution.Client.Dependency.Modular.PSQ as P
+import Distribution.Client.Dependency.Modular.PSQ (PSQ)
+import qualified Distribution.Client.Dependency.Modular.PSQ as P
 import Distribution.Client.Dependency.Modular.Version
 import Distribution.Client.Dependency.Types ( ConstraintSource(..) )
 
@@ -42,7 +57,7 @@ data Tree a =
 --
 -- Linking is an essential part of this story. In addition to picking a specific
 -- version for @1.P@, the solver can also decide to link @1.P@ to @0.P@ (or
--- vice versa). Teans that @1.P@ and @0.P@ really must be the very same package
+-- vice versa). It means that @1.P@ and @0.P@ really must be the very same package
 -- (and hence must have the same build time configuration, and their
 -- dependencies must also be the exact same).
 --
@@ -68,6 +83,7 @@ data FailReason = InconsistentInitialConstraints
                 | Backjump
                 | MultipleInstances
                 | DependenciesNotLinked String
+                | CyclicDependencies
   deriving (Eq, Show)
 
 -- | Functor for the tree type.
@@ -119,15 +135,23 @@ choices (GoalChoice         _ ) = 1
 choices (Done       _         ) = 1
 choices (Fail       _ _       ) = 0
 
--- | Variant of 'choices' that only approximates the number of choices,
--- using 'llength'.
-lchoices :: Tree a -> Int
-lchoices (PChoice    _ _     ts) = P.llength (P.filter active ts)
-lchoices (FChoice    _ _ _ _ ts) = P.llength (P.filter active ts)
-lchoices (SChoice    _ _ _   ts) = P.llength (P.filter active ts)
-lchoices (GoalChoice         _ ) = 1
-lchoices (Done       _         ) = 1
-lchoices (Fail       _ _       ) = 0
+-- | Variant of 'choices' that only approximates the number of choices.
+dchoices :: Tree a -> P.Degree
+dchoices (PChoice    _ _     ts) = P.degree (P.filter active ts)
+dchoices (FChoice    _ _ _ _ ts) = P.degree (P.filter active ts)
+dchoices (SChoice    _ _ _   ts) = P.degree (P.filter active ts)
+dchoices (GoalChoice         _ ) = P.ZeroOrOne
+dchoices (Done       _         ) = P.ZeroOrOne
+dchoices (Fail       _ _       ) = P.ZeroOrOne
+
+-- | Variant of 'choices' that only approximates the number of choices.
+zeroOrOneChoices :: Tree a -> Bool
+zeroOrOneChoices (PChoice    _ _     ts) = P.isZeroOrOne (P.filter active ts)
+zeroOrOneChoices (FChoice    _ _ _ _ ts) = P.isZeroOrOne (P.filter active ts)
+zeroOrOneChoices (SChoice    _ _ _   ts) = P.isZeroOrOne (P.filter active ts)
+zeroOrOneChoices (GoalChoice         _ ) = True
+zeroOrOneChoices (Done       _         ) = True
+zeroOrOneChoices (Fail       _ _       ) = True
 
 -- | Catamorphism on trees.
 cata :: (TreeF a b -> b) -> Tree a -> b
@@ -140,12 +164,6 @@ trav psi x = cata (inn . psi) x
 para :: (TreeF a (b, Tree a) -> b) -> Tree a -> b
 para phi = phi . fmap (\ x -> (para phi x, x)) . out
 
-cataM :: Monad m => (TreeF a b -> m b) -> Tree a -> m b
-cataM phi = phi <=< mapM (cataM phi) <=< return . out
-
 -- | Anamorphism on trees.
 ana :: (b -> TreeF a b) -> b -> Tree a
 ana psi = inn . fmap (ana psi) . psi
-
-anaM :: Monad m => (b -> m (TreeF a b)) -> b -> m (Tree a)
-anaM psi = return . inn <=< mapM (anaM psi) <=< psi

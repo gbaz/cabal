@@ -33,8 +33,20 @@ module Distribution.PackageDescription.Check (
         checkPackageFileNames,
   ) where
 
+import Distribution.PackageDescription
+import Distribution.PackageDescription.Configuration
+import Distribution.Compiler
+import Distribution.System
+import Distribution.License
+import Distribution.Simple.CCompiler
+import Distribution.Simple.Utils hiding (findPackageDesc, notice)
+import Distribution.Version
+import Distribution.Package
+import Distribution.Text
+import Language.Haskell.Extension
+
 import Data.Maybe
-         ( isNothing, isJust, catMaybes, maybeToList, fromMaybe )
+         ( isNothing, isJust, catMaybes, mapMaybe, fromMaybe )
 import Data.List  (sort, group, isPrefixOf, nub, find)
 import Control.Monad
          ( filterM, liftM )
@@ -42,41 +54,9 @@ import qualified System.Directory as System
          ( doesFileExist, doesDirectoryExist )
 import qualified Data.Map as Map
 
-import Distribution.PackageDescription
-import Distribution.PackageDescription.Configuration
-         ( flattenPackageDescription, finalizePackageDescription )
-import Distribution.Compiler
-         ( CompilerFlavor(..), buildCompilerFlavor, CompilerId(..)
-         , unknownCompilerInfo, AbiTag(..) )
-import Distribution.System
-         ( OS(..), Arch(..), buildPlatform )
-import Distribution.License
-         ( License(..), knownLicenses )
-import Distribution.Simple.CCompiler
-         ( filenameCDialect )
-import Distribution.Simple.Utils
-         ( cabalVersion, intercalate, parseFileGlob, FileGlob(..), lowercase, startsWithBOM, fromUTF8 )
-
-import Distribution.Version
-         ( Version(..)
-         , VersionRange(..), foldVersionRange'
-         , anyVersion, noVersion, thisVersion, laterVersion, earlierVersion
-         , orLaterVersion, orEarlierVersion
-         , unionVersionRanges, intersectVersionRanges
-         , asVersionIntervals, UpperBound(..), isNoVersion )
-import Distribution.Package
-         ( PackageName(PackageName), packageName, packageVersion
-         , Dependency(..), pkgName )
-
-import Distribution.Text
-         ( display, disp )
 import qualified Text.PrettyPrint as Disp
 import Text.PrettyPrint ((<>), (<+>))
 
-import qualified Language.Haskell.Extension as Extension (deprecatedExtensions)
-import Language.Haskell.Extension
-         ( Language(UnknownLanguage), knownLanguages
-         , Extension(..), KnownExtension(..) )
 import qualified System.Directory (getDirectoryContents)
 import System.IO (openBinaryFile, IOMode(ReadMode), hGetContents)
 import System.FilePath
@@ -111,7 +91,7 @@ data PackageCheck =
      | PackageDistSuspicious { explanation :: String }
 
        -- | Like PackageDistSuspicious but will only display warnings
-       -- rather than causing abnormal exit.
+       -- rather than causing abnormal exit when you run 'cabal check'.
      | PackageDistSuspiciousWarn { explanation :: String }
 
        -- | An issue that is OK in the author's environment but is almost
@@ -193,19 +173,19 @@ checkSanity pkg =
   , check (all ($ pkg) [ null . executables
                        , null . testSuites
                        , null . benchmarks
-                       , isNothing . library ]) $
+                       , null . libraries ]) $
       PackageBuildImpossible
         "No executables, libraries, tests, or benchmarks found. Nothing to do."
 
   , check (not (null duplicateNames)) $
       PackageBuildImpossible $ "Duplicate sections: " ++ commaSep duplicateNames
-        ++ ". The name of every executable, test suite, and benchmark section in"
+        ++ ". The name of every library, executable, test suite, and benchmark section in"
         ++ " the package must be unique."
   ]
   --TODO: check for name clashes case insensitively: windows file systems cannot
   --cope.
 
-  ++ maybe []  (checkLibrary    pkg) (library pkg)
+  ++ concatMap (checkLibrary    pkg) (libraries pkg)
   ++ concatMap (checkExecutable pkg) (executables pkg)
   ++ concatMap (checkTestSuite  pkg) (testSuites pkg)
   ++ concatMap (checkBenchmark  pkg) (benchmarks pkg)
@@ -219,10 +199,15 @@ checkSanity pkg =
         ++ "tool only supports up to version " ++ display cabalVersion ++ "."
   ]
   where
+    -- The public library gets special dispensation, because it
+    -- is common practice to export a library and name the executable
+    -- the same as the package.  We always put the public library
+    -- in the top-level directory in dist, so no conflicts either.
+    libNames = filter (/= unPackageName (packageName pkg)) . map libName $ libraries pkg
     exeNames = map exeName $ executables pkg
     testNames = map testName $ testSuites pkg
     bmNames = map benchmarkName $ benchmarks pkg
-    duplicateNames = dups $ exeNames ++ testNames ++ bmNames
+    duplicateNames = dups $ libNames ++ exeNames ++ testNames ++ bmNames
 
 checkLibrary :: PackageDescription -> Library -> [PackageCheck]
 checkLibrary pkg lib =
@@ -317,14 +302,6 @@ checkTestSuite pkg test =
       PackageDistInexcusable $
            "The package uses a C/C++/obj-C source file for the 'main-is' field. "
         ++ "To use this feature you must specify 'cabal-version: >= 1.18'."
-
-    -- Test suites might be built as (internal) libraries named after
-    -- the test suite and thus their names must not clash with the
-    -- name of the package.
-  , check libNameClash $
-      PackageBuildImpossible $
-           "The test suite " ++ testName test
-        ++ " has the same name as the package."
   ]
   where
     moduleDuplicates = dups $ testModules test
@@ -337,13 +314,8 @@ checkTestSuite pkg test =
       TestSuiteExeV10 _ f -> takeExtension f `notElem` [".hs", ".lhs"]
       _                   -> False
 
-    libNameClash = testName test `elem` [ libName
-                                        | _lib <- maybeToList (library pkg)
-                                        , let PackageName libName =
-                                                pkgName (package pkg) ]
-
 checkBenchmark :: PackageDescription -> Benchmark -> [PackageCheck]
-checkBenchmark pkg bm =
+checkBenchmark _pkg bm =
   catMaybes [
 
     case benchmarkInterface bm of
@@ -369,12 +341,6 @@ checkBenchmark pkg bm =
       PackageBuildImpossible $
            "The 'main-is' field must specify a '.hs' or '.lhs' file "
         ++ "(even if it is generated by a preprocessor)."
-
-    -- See comment for similar check on test suites.
-  , check libNameClash $
-      PackageBuildImpossible $
-           "The benchmark " ++ benchmarkName bm
-        ++ " has the same name as the package."
   ]
   where
     moduleDuplicates = dups $ benchmarkModules bm
@@ -382,11 +348,6 @@ checkBenchmark pkg bm =
     mainIsWrongExt = case benchmarkInterface bm of
       BenchmarkExeV10 _ f -> takeExtension f `notElem` [".hs", ".lhs"]
       _                   -> False
-
-    libNameClash = benchmarkName bm `elem` [ libName
-                                           | _lib <- maybeToList (library pkg)
-                                           , let PackageName libName =
-                                                   pkgName (package pkg) ]
 
 -- ------------------------------------------------------------
 -- * Additional pure checks
@@ -402,6 +363,11 @@ checkFields pkg =
         ++ "' is one of the reserved system file names on Windows. Many tools "
         ++ "need to convert package names to file names so using this name "
         ++ "would cause problems."
+
+  , check ((isPrefixOf "z-") . display . packageName $ pkg) $
+      PackageDistInexcusable $
+           "Package names with the prefix 'z-' are reserved by Cabal and "
+        ++ "cannot be used."
 
   , check (isNothing (buildType pkg)) $
       PackageBuildWarning $
@@ -442,14 +408,14 @@ checkFields pkg =
         ++ ". Languages must be specified in either the 'default-language' "
         ++ " or the 'other-languages' field."
 
-  , check (not (null deprecatedExtensions)) $
+  , check (not (null ourDeprecatedExtensions)) $
       PackageDistSuspicious $
            "Deprecated extensions: "
-        ++ commaSep (map (quote . display . fst) deprecatedExtensions)
+        ++ commaSep (map (quote . display . fst) ourDeprecatedExtensions)
         ++ ". " ++ unwords
              [ "Instead of '" ++ display ext
             ++ "' use '" ++ display replacement ++ "'."
-             | (ext, Just replacement) <- deprecatedExtensions ]
+             | (ext, Just replacement) <- ourDeprecatedExtensions ]
 
   , check (null (category pkg)) $
       PackageDistSuspicious "No 'category' field."
@@ -491,8 +457,8 @@ checkFields pkg =
     unknownExtensions = [ name | bi <- allBuildInfo pkg
                                , UnknownExtension name <- allExtensions bi
                                , name `notElem` map display knownLanguages ]
-    deprecatedExtensions = nub $ catMaybes
-      [ find ((==ext) . fst) Extension.deprecatedExtensions
+    ourDeprecatedExtensions = nub $ catMaybes
+      [ find ((==ext) . fst) deprecatedExtensions
       | bi <- allBuildInfo pkg
       , ext <- allExtensions bi ]
     languagesUsedAsExtensions =
@@ -713,12 +679,21 @@ checkGhcOptions pkg =
 
   , checkAlternatives "ghc-options" "extra-lib-dirs"
       [ (flag, dir) | flag@('-':'L':dir) <- all_ghc_options ]
+
+  , checkAlternatives "ghc-options" "frameworks"
+      [ (flag, fmwk) | (flag@"-framework", fmwk) <-
+           zip all_ghc_options (safeTail all_ghc_options) ]
+
+  , checkAlternatives "ghc-options" "extra-framework-dirs"
+      [ (flag, dir) | (flag@"-framework-path", dir) <-
+           zip all_ghc_options (safeTail all_ghc_options) ]
   ]
 
   where
     all_ghc_options    = concatMap get_ghc_options (allBuildInfo pkg)
-    lib_ghc_options    = maybe [] (get_ghc_options . libBuildInfo) (library pkg)
+    lib_ghc_options    = concatMap (get_ghc_options . libBuildInfo) (libraries pkg)
     get_ghc_options bi = hcOptions GHC bi ++ hcProfOptions GHC bi
+                         ++ hcSharedOptions GHC bi
 
     checkFlags :: [String] -> PackageCheck -> Maybe PackageCheck
     checkFlags flags = check (any (`elem` flags) all_ghc_options)
@@ -939,9 +914,18 @@ checkCabalVersion pkg =
         ++ "different modules then list the other ones in the "
         ++ "'other-languages' field."
 
+  , checkVersion [1,23]
+    (case libraries pkg of
+        [lib] -> libName lib /= unPackageName (packageName pkg)
+        [] -> False
+        _ -> True) $
+      PackageDistInexcusable $
+           "To use multiple 'library' sections or a named library section "
+        ++ "the package needs to specify at least 'cabal-version >= 1.23'."
+
     -- check use of reexported-modules sections
   , checkVersion [1,21]
-    (maybe False (not.null.reexportedModules) (library pkg)) $
+    (any (not.null.reexportedModules) (libraries pkg)) $
       PackageDistInexcusable $
            "To use the 'reexported-module' field the package needs to specify "
         ++ "at least 'cabal-version: >= 1.21'."
@@ -954,6 +938,13 @@ checkCabalVersion pkg =
         ++ commaSep (map display depsUsingThinningRenamingSyntax)
         ++ ". To use this new syntax, the package needs to specify at least"
         ++ "'cabal-version: >= 1.21'."
+
+    -- check use of 'extra-framework-dirs' field
+  , checkVersion [1,23] (any (not . null) (buildInfoField extraFrameworkDirs)) $
+      -- Just a warning, because this won't break on old Cabal versions.
+      PackageDistSuspiciousWarn $
+           "To use the 'extra-framework-dirs' field the package needs to specify"
+        ++ " at least 'cabal-version: >= 1.23'."
 
     -- check use of default-extensions field
     -- don't need to do the equivalent check for other-extensions
@@ -1080,7 +1071,7 @@ checkCabalVersion pkg =
   , check (specVersion pkg < Version [1,23] []
            && isNothing (setupBuildInfo pkg)
            && buildType pkg == Just Custom) $
-      PackageDistSuspicious $
+      PackageDistSuspiciousWarn $
            "From version 1.23 cabal supports specifiying explicit dependencies "
         ++ "for Custom setup scripts. Consider using cabal-version >= 1.23 and "
         ++ "adding a 'custom-setup' section with a 'setup-depends' field "
@@ -1152,8 +1143,7 @@ checkCabalVersion pkg =
     depsUsingThinningRenamingSyntax =
       [ name
       | bi <- allBuildInfo pkg
-      , (name, rns) <- Map.toList (targetBuildRenaming bi)
-      , rns /= ModuleRenaming True [] ]
+      , (name, _) <- Map.toList (targetBuildRenaming bi) ]
 
     testedWithUsingWildcardSyntax =
       [ Dependency (PackageName (display compiler)) vr
@@ -1341,10 +1331,10 @@ checkConditionals pkg =
     unknownOSs    = [ os   | OS   (OtherOS os)           <- conditions ]
     unknownArches = [ arch | Arch (OtherArch arch)       <- conditions ]
     unknownImpls  = [ impl | Impl (OtherCompiler impl) _ <- conditions ]
-    conditions = maybe [] freeVars (condLibrary pkg)
-              ++ concatMap (freeVars . snd) (condExecutables pkg)
-    freeVars (CondNode _ _ ifs) = concatMap compfv ifs
-    compfv (c, ct, mct) = condfv c ++ freeVars ct ++ maybe [] freeVars mct
+    conditions = concatMap (fvs . snd) (condLibraries pkg)
+              ++ concatMap (fvs . snd) (condExecutables pkg)
+    fvs (CondNode _ _ ifs) = concatMap compfv ifs -- free variables
+    compfv (c, ct, mct) = condfv c ++ fvs ct ++ maybe [] fvs mct
     condfv c = case c of
       Var v      -> [v]
       Lit _      -> []
@@ -1408,6 +1398,7 @@ checkDevelopmentOnlyFlagsBuildInfo bi =
     has_Wall         = "-Wall"   `elem` ghc_options
     has_W            = "-W"      `elem` ghc_options
     ghc_options      = hcOptions GHC bi ++ hcProfOptions GHC bi
+                       ++ hcSharedOptions GHC bi
 
     checkFlags :: [String] -> PackageCheck -> Maybe PackageCheck
     checkFlags flags = check (any (`elem` flags) ghc_options)
@@ -1444,8 +1435,8 @@ checkDevelopmentOnlyFlags pkg =
 
     allConditionalBuildInfo :: [([Condition ConfVar], BuildInfo)]
     allConditionalBuildInfo =
-        concatMap (collectCondTreePaths libBuildInfo)
-                  (maybeToList (condLibrary pkg))
+        concatMap (collectCondTreePaths libBuildInfo . snd)
+                  (condLibraries pkg)
 
      ++ concatMap (collectCondTreePaths buildInfo . snd)
                   (condExecutables pkg)
@@ -1538,7 +1529,8 @@ checkCabalFileBOM ops = do
                                     pdfile ++ " starts with an Unicode byte order mark (BOM). This may cause problems with older cabal versions."
 
 -- |Find a package description file in the given directory.  Looks for
--- @.cabal@ files.
+-- @.cabal@ files.  Like 'Distribution.Simple.Utils.findPackageDesc',
+-- but generalized over monads.
 findPackageDesc :: Monad m => CheckPackageContentOps m
                  -> m (Either PackageCheck FilePath) -- ^<pkgname>.cabal
 findPackageDesc ops
@@ -1610,6 +1602,8 @@ checkLocalPathsExist ops pkg = do
              | bi <- allBuildInfo pkg
              , (dir, kind) <-
                   [ (dir, "extra-lib-dirs") | dir <- extraLibDirs bi ]
+               ++ [ (dir, "extra-framework-dirs")
+                  | dir <- extraFrameworkDirs  bi ]
                ++ [ (dir, "include-dirs")   | dir <- includeDirs  bi ]
                ++ [ (dir, "hs-source-dirs") | dir <- hsSourceDirs bi ]
              , isRelative dir ]
@@ -1658,8 +1652,8 @@ repoTypeDirname _          = []
 --
 checkPackageFileNames :: [FilePath] -> [PackageCheck]
 checkPackageFileNames files =
-     (take 1 . catMaybes . map checkWindowsPath $ files)
-  ++ (take 1 . catMaybes . map checkTarPath     $ files)
+     (take 1 . mapMaybe checkWindowsPath $ files)
+  ++ (take 1 . mapMaybe checkTarPath     $ files)
       -- If we get any of these checks triggering then we're likely to get
       -- many, and that's probably not helpful, so return at most one.
 

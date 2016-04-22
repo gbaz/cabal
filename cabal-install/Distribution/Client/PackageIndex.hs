@@ -1,5 +1,6 @@
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE DeriveFunctor #-}
+{-# LANGUAGE DeriveGeneric #-}
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.Client.PackageIndex
@@ -54,6 +55,9 @@ import Data.List (groupBy, sortBy, isInfixOf)
 import Data.Monoid (Monoid(..))
 #endif
 import Data.Maybe (isJust, fromMaybe)
+import GHC.Generics (Generic)
+import Distribution.Compat.Binary (Binary)
+import Distribution.Compat.Semigroup (Semigroup((<>)))
 
 import Distribution.Package
          ( PackageName(..), PackageIdentifier(..)
@@ -78,14 +82,20 @@ newtype PackageIndex pkg = PackageIndex
   --
   (Map PackageName [pkg])
 
-  deriving (Show, Read, Functor)
+  deriving (Eq, Show, Read, Functor, Generic)
+--FIXME: the Functor instance here relies on no package id changes
+
+instance Package pkg => Semigroup (PackageIndex pkg) where
+  (<>) = merge
 
 instance Package pkg => Monoid (PackageIndex pkg) where
   mempty  = PackageIndex Map.empty
-  mappend = merge
+  mappend = (<>)
   --save one mappend with empty in the common case:
   mconcat [] = mempty
   mconcat xs = foldr1 mappend xs
+
+instance Binary pkg => Binary (PackageIndex pkg)
 
 invariant :: Package pkg => PackageIndex pkg -> Bool
 invariant (PackageIndex m) = all (uncurry goodBucket) (Map.toList m)

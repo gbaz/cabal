@@ -26,6 +26,9 @@ module Distribution.Simple.Utils (
         debugNoWrap, chattyTry,
         printRawCommandAndArgs, printRawCommandAndArgsAndEnv,
 
+        -- * exceptions
+        handleDoesNotExist,
+
         -- * running programs
         rawSystemExit,
         rawSystemExitCode,
@@ -65,6 +68,8 @@ module Distribution.Simple.Utils (
         -- * file names
         currentDir,
         shortRelativePath,
+        dropExeExtension,
+        exeExtensions,
 
         -- * finding files
         findFile,
@@ -132,12 +137,37 @@ module Distribution.Simple.Utils (
         listUnionRight,
         ordNub,
         ordNubRight,
+        safeTail,
         wrapText,
         wrapLine,
   ) where
 
+import Distribution.Text
+import Distribution.Package
+import Distribution.ModuleName as ModuleName
+import Distribution.System
+import Distribution.Version
+import Distribution.Compat.CopyFile
+import Distribution.Compat.Internal.TempFile
+import Distribution.Compat.Exception
+import Distribution.Verbosity
+
+#if __GLASGOW_HASKELL__ < 711
+#ifdef VERSION_base
+#define BOOTSTRAPPED_CABAL 1
+#endif
+#else
+#ifdef CURRENT_PACKAGE_KEY
+#define BOOTSTRAPPED_CABAL 1
+#endif
+#endif
+
+#ifdef BOOTSTRAPPED_CABAL
+import qualified Paths_Cabal (version)
+#endif
+
 import Control.Monad
-    ( join, when, unless, filterM )
+    ( when, unless, filterM )
 import Control.Concurrent.MVar
     ( newEmptyMVar, putMVar, takeMVar )
 import Data.Bits
@@ -147,9 +177,11 @@ import Data.Char as Char
 import Data.Foldable
     ( traverse_ )
 import Data.List
-    ( nub, unfoldr, isPrefixOf, tails, intercalate )
+    ( nub, unfoldr, intercalate, isInfixOf )
 import Data.Typeable
     ( cast )
+import Data.Ord
+    ( comparing )
 import qualified Data.ByteString.Lazy as BS
 import qualified Data.ByteString.Lazy.Char8 as BS.Char8
 import qualified Data.Set as Set
@@ -182,17 +214,6 @@ import System.IO.Unsafe
     ( unsafeInterleaveIO )
 import qualified Control.Exception as Exception
 
-import Distribution.Text
-    ( display, simpleParse )
-import Distribution.Package
-    ( PackageIdentifier )
-import Distribution.ModuleName (ModuleName)
-import qualified Distribution.ModuleName as ModuleName
-import Distribution.System
-    ( OS (..) )
-import Distribution.Version
-    (Version(..))
-
 import Control.Exception (IOException, evaluate, throwIO)
 import Control.Concurrent (forkIO)
 import qualified System.Process as Process
@@ -200,22 +221,10 @@ import qualified System.Process as Process
 import System.Process
          ( ProcessHandle, createProcess, rawSystem, runInteractiveProcess
          , showCommandForUser, waitForProcess)
-import Distribution.Compat.CopyFile
-         ( copyFile, copyOrdinaryFile, copyExecutableFile
-         , setFileOrdinary, setFileExecutable, setDirOrdinary )
-import Distribution.Compat.TempFile
-         ( openTempFile, createTempDirectory )
-import Distribution.Compat.Exception
-         ( tryIO, catchIO, catchExit )
-import Distribution.Verbosity
-
-#ifdef VERSION_base
-import qualified Paths_Cabal (version)
-#endif
 
 -- We only get our own version number when we're building with ourselves
 cabalVersion :: Version
-#if defined(VERSION_base)
+#if defined(BOOTSTRAPPED_CABAL)
 cabalVersion = Paths_Cabal.version
 #elif defined(CABAL_VERSION)
 cabalVersion = Version [CABAL_VERSION] []
@@ -259,7 +268,7 @@ topHandlerWith cont prog =
     handle se = do
       hFlush stdout
       pname <- getProgName
-      hPutStr stderr (message pname se)
+      hPutStr stderr (wrapText (message pname se))
       cont se
 
     message :: String -> Exception.SomeException -> String
@@ -273,7 +282,7 @@ topHandlerWith cont prog =
                                l@(n:_) | Char.isDigit n -> ':' : l
                                _                        -> ""
               detail       = ioeGetErrorString ioe
-          in wrapText (pname ++ ": " ++ file ++ detail)
+          in pname ++ ": " ++ file ++ detail
         Nothing ->
 #if __GLASGOW_HASKELL__ < 710
           show se
@@ -345,6 +354,14 @@ chattyTry :: String  -- ^ a description of the action we were attempting
 chattyTry desc action =
   catchIO action $ \exception ->
     putStrLn $ "Error while " ++ desc ++ ": " ++ show exception
+
+-- | Run an IO computation, returning @e@ if it raises a "file
+-- does not exist" error.
+handleDoesNotExist :: a -> IO a -> IO a
+handleDoesNotExist e =
+    Exception.handleJust
+      (\ioe -> if isDoesNotExistError ioe then Just ioe else Nothing)
+      (\_ -> return e)
 
 -- -----------------------------------------------------------------------------
 -- Helper functions
@@ -461,17 +478,18 @@ rawSystemIOWithEnv verbosity path args mcwd menv inp out err = do
     mbToStd :: Maybe Handle -> Process.StdStream
     mbToStd = maybe Process.Inherit Process.UseHandle
 
-createProcessWithEnv :: Verbosity
-                     -> FilePath
-                     -> [String]
-                     -> Maybe FilePath           -- ^ New working dir or inherit
-                     -> Maybe [(String, String)] -- ^ New environment or inherit
-                     -> Process.StdStream  -- ^ stdin
-                     -> Process.StdStream  -- ^ stdout
-                     -> Process.StdStream  -- ^ stderr
-                     -> IO (Maybe Handle, Maybe Handle, Maybe Handle, ProcessHandle)
-                        -- ^ Any handles created for stdin, stdout, or stderr
-                        -- with 'CreateProcess', and a handle to the process.
+createProcessWithEnv ::
+  Verbosity
+  -> FilePath
+  -> [String]
+  -> Maybe FilePath           -- ^ New working dir or inherit
+  -> Maybe [(String, String)] -- ^ New environment or inherit
+  -> Process.StdStream  -- ^ stdin
+  -> Process.StdStream  -- ^ stdout
+  -> Process.StdStream  -- ^ stderr
+  -> IO (Maybe Handle, Maybe Handle, Maybe Handle,ProcessHandle)
+  -- ^ Any handles created for stdin, stdout, or stderr
+  -- with 'CreateProcess', and a handle to the process.
 createProcessWithEnv verbosity path args mcwd menv inp out err = do
     printRawCommandAndArgsAndEnv verbosity path args menv
     hFlush stdout
@@ -572,6 +590,8 @@ rawSystemStdInOut verbosity path args mcwd menv input outputBinary = do
       return (out, err, exitcode)
 
 
+{-# DEPRECATED findProgramLocation
+    "No longer used within Cabal, try findProgramOnSearchPath" #-}
 -- | Look for a program on the path.
 findProgramLocation :: Verbosity -> FilePath -> IO (Maybe FilePath)
 findProgramLocation verbosity prog = do
@@ -717,12 +737,12 @@ findModuleFile :: [FilePath]  -- ^ build prefix (location of objects)
                -> [String]    -- ^ search suffixes
                -> ModuleName  -- ^ module
                -> IO (FilePath, FilePath)
-findModuleFile searchPath extensions moduleName =
+findModuleFile searchPath extensions mod_name =
       maybe notFound return
   =<< findFileWithExtension' extensions searchPath
-                             (ModuleName.toFilePath moduleName)
+                             (ModuleName.toFilePath mod_name)
   where
-    notFound = die $ "Error: Could not find module: " ++ display moduleName
+    notFound = die $ "Error: Could not find module: " ++ display mod_name
                   ++ " with any suffix: " ++ show extensions
                   ++ " in the search path: " ++ show searchPath
 
@@ -1016,7 +1036,8 @@ copyDirectoryRecursive :: Verbosity -> FilePath -> FilePath -> IO ()
 copyDirectoryRecursive verbosity srcDir destDir = do
   info verbosity ("copy directory '" ++ srcDir ++ "' to '" ++ destDir ++ "'.")
   srcFiles <- getDirectoryContentsRecursive srcDir
-  copyFilesWith (const copyFile) verbosity destDir [ (srcDir, f) | f <- srcFiles ]
+  copyFilesWith (const copyFile) verbosity destDir [ (srcDir, f)
+                                                   | f <- srcFiles ]
 
 -------------------
 -- File permissions
@@ -1078,7 +1099,8 @@ withTempFileEx opts tmpDir template action =
   Exception.bracket
     (openTempFile tmpDir template)
     (\(name, handle) -> do hClose handle
-                           unless (optKeepTempFiles opts) $ removeFile name)
+                           unless (optKeepTempFiles opts) $
+                             handleDoesNotExist () . removeFile $ name)
     (uncurry action)
 
 -- | Create and use a temporary directory.
@@ -1104,7 +1126,8 @@ withTempDirectoryEx :: Verbosity
 withTempDirectoryEx _verbosity opts targetDir template =
   Exception.bracket
     (createTempDirectory targetDir template)
-    (unless (optKeepTempFiles opts) . removeDirectoryRecursive)
+    (unless (optKeepTempFiles opts)
+     . handleDoesNotExist () . removeDirectoryRecursive)
 
 -----------------------------------
 -- Safely reading and writing files
@@ -1171,6 +1194,24 @@ shortRelativePath from to =
         | x == y    = dropCommonPrefix xs ys
     dropCommonPrefix xs ys = (xs,ys)
 
+-- | Drop the extension if it's one of 'exeExtensions', or return the path
+-- unchanged.
+dropExeExtension :: FilePath -> FilePath
+dropExeExtension filepath =
+  case splitExtension filepath of
+    (filepath', extension) | extension `elem` exeExtensions -> filepath'
+                           | otherwise                      -> filepath
+
+-- | List of possible executable file extensions on the current platform.
+exeExtensions :: [String]
+exeExtensions = case buildOS of
+  -- Possible improvement: on Windows, read the list of extensions from the
+  -- PATHEXT environment variable. By default PATHEXT is ".com; .exe; .bat;
+  -- .cmd".
+  Windows -> ["", "exe"]
+  Ghcjs   -> ["", "exe"]
+  _       -> [""]
+
 -- ------------------------------------------------------------
 -- * Finding the description file
 -- ------------------------------------------------------------
@@ -1209,7 +1250,7 @@ findPackageDesc dir
 
 -- |Like 'findPackageDesc', but calls 'die' in case of error.
 tryFindPackageDesc :: FilePath -> IO FilePath
-tryFindPackageDesc dir = join . fmap (either die return) $ findPackageDesc dir
+tryFindPackageDesc dir = either die return =<< findPackageDesc dir
 
 -- |Optional auxiliary package information file (/pkgname/@.buildinfo@)
 defaultHookedPackageDesc :: IO (Maybe FilePath)
@@ -1433,14 +1474,13 @@ listUnionRight a b = ordNubRight (filter (`Set.notMember` bSet) a) ++ b
   where
     bSet = Set.fromList b
 
+-- | A total variant of 'tail'.
+safeTail :: [a] -> [a]
+safeTail []     = []
+safeTail (_:xs) = xs
+
 equating :: Eq a => (b -> a) -> b -> b -> Bool
 equating p x y = p x == p y
-
-comparing :: Ord a => (b -> a) -> b -> b -> Ordering
-comparing p x y = p x `compare` p y
-
-isInfixOf :: String -> String -> Bool
-isInfixOf needle haystack = any (isPrefixOf needle) (tails haystack)
 
 lowercase :: String -> String
 lowercase = map Char.toLower

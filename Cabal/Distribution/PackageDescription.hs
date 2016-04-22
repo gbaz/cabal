@@ -1,4 +1,3 @@
-{-# LANGUAGE CPP #-}
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE DeriveGeneric #-}
 
@@ -44,6 +43,7 @@ module Distribution.PackageDescription (
         ModuleReexport(..),
         emptyLibrary,
         withLib,
+        hasPublicLib,
         hasLibs,
         libModules,
 
@@ -90,6 +90,8 @@ module Distribution.PackageDescription (
         hcSharedOptions,
 
         -- ** Supplementary build information
+        ComponentName(..),
+        defaultLibName,
         HookedBuildInfo,
         emptyHookedBuildInfo,
         updatePackageDescription,
@@ -98,7 +100,7 @@ module Distribution.PackageDescription (
         GenericPackageDescription(..),
         Flag(..), FlagName(..), FlagAssignment,
         CondTree(..), ConfVar(..), Condition(..),
-        cNot,
+        cNot, cAnd, cOr,
 
         -- * Source repositories
         SourceRepo(..),
@@ -110,42 +112,33 @@ module Distribution.PackageDescription (
         SetupBuildInfo(..),
   ) where
 
-import Distribution.Compat.Binary (Binary)
+import Distribution.Compat.Binary
+import qualified Distribution.Compat.Semigroup as Semi ((<>))
+import Distribution.Compat.Semigroup as Semi (Monoid(..), Semigroup, gmempty)
+import qualified Distribution.Compat.ReadP as Parse
+import Distribution.Compat.ReadP   ((<++))
+import Distribution.Package
+import Distribution.ModuleName
+import Distribution.Version
+import Distribution.License
+import Distribution.Compiler
+import Distribution.System
+import Distribution.Text
+import Language.Haskell.Extension
+
 import Data.Data                  (Data)
-import Data.Foldable              (traverse_)
 import Data.List                  (nub, intercalate)
 import Data.Maybe                 (fromMaybe, maybeToList)
-#if __GLASGOW_HASKELL__ < 710
-import Control.Applicative        (Applicative((<*>), pure))
-import Data.Monoid                (Monoid(mempty, mappend))
-import Data.Foldable              (Foldable(foldMap))
-import Data.Traversable           (Traversable(traverse))
-#endif
+import Data.Foldable as Fold      (Foldable(foldMap))
+import Data.Traversable as Trav   (Traversable(traverse))
 import Data.Typeable               ( Typeable )
-import Control.Applicative         (Alternative(..))
+import Control.Applicative as AP   (Alternative(..), Applicative(..))
 import Control.Monad               (MonadPlus(mplus,mzero), ap)
 import GHC.Generics                (Generic)
 import Text.PrettyPrint as Disp
-import qualified Distribution.Compat.ReadP as Parse
-import Distribution.Compat.ReadP   ((<++))
 import qualified Data.Char as Char (isAlphaNum, isDigit, toLower)
 import qualified Data.Map as Map
 import Data.Map                    (Map)
-
-import Distribution.Package
-         ( PackageName(PackageName), PackageIdentifier(PackageIdentifier)
-         , Dependency, Package(..), PackageName, packageName )
-import Distribution.ModuleName ( ModuleName )
-import Distribution.Version
-         ( Version(Version), VersionRange, anyVersion, orLaterVersion
-         , asVersionIntervals, LowerBound(..) )
-import Distribution.License  (License(UnspecifiedLicense))
-import Distribution.Compiler (CompilerFlavor)
-import Distribution.System   (OS, Arch)
-import Distribution.Text
-         ( Text(..), display )
-import Language.Haskell.Extension
-         ( Language, Extension )
 
 -- -----------------------------------------------------------------------------
 -- The PackageDescription type
@@ -177,6 +170,7 @@ data PackageDescription
         customFieldsPD :: [(String,String)], -- ^Custom fields starting
                                              -- with x-, stored in a
                                              -- simple assoc-list.
+
         -- | YOU PROBABLY DON'T WANT TO USE THIS FIELD. This field is
         -- special! Depending on how far along processing the
         -- PackageDescription we are, the contents of this field are
@@ -197,7 +191,7 @@ data PackageDescription
         buildType      :: Maybe BuildType,
         setupBuildInfo :: Maybe SetupBuildInfo,
         -- components
-        library        :: Maybe Library,
+        libraries      :: [Library],
         executables    :: [Executable],
         testSuites     :: [TestSuite],
         benchmarks     :: [Benchmark],
@@ -264,7 +258,7 @@ emptyPackageDescription
                       category     = "",
                       customFieldsPD = [],
                       setupBuildInfo = Nothing,
-                      library      = Nothing,
+                      libraries    = [],
                       executables  = [],
                       testSuites   = [],
                       benchmarks   = [],
@@ -316,20 +310,24 @@ instance Text BuildType where
 -- options authors can specify to just Haskell package dependencies.
 
 data SetupBuildInfo = SetupBuildInfo {
-        setupDepends :: [Dependency]
+        setupDepends        :: [Dependency],
+        defaultSetupDepends :: Bool
+        -- ^ Is this a default 'custom-setup' section added by the cabal-install
+        -- code (as opposed to user-provided)? This field is only used
+        -- internally, and doesn't correspond to anything in the .cabal
+        -- file. See #3199.
     }
     deriving (Generic, Show, Eq, Read, Typeable, Data)
 
 instance Binary SetupBuildInfo
 
-instance Monoid SetupBuildInfo where
-  mempty = SetupBuildInfo {
-    setupDepends = mempty
-  }
-  mappend a b = SetupBuildInfo {
-    setupDepends = combine setupDepends
-  }
-    where combine field = field a `mappend` field b
+instance Semi.Monoid SetupBuildInfo where
+  mempty  = SetupBuildInfo [] False
+  mappend = (Semi.<>)
+
+instance Semigroup SetupBuildInfo where
+  a <> b = SetupBuildInfo (setupDepends a Semi.<> setupDepends b)
+           (defaultSetupDepends a || defaultSetupDepends b)
 
 -- ---------------------------------------------------------------------------
 -- Module renaming
@@ -352,9 +350,12 @@ lookupRenaming = Map.findWithDefault defaultRenaming . packageName
 instance Binary ModuleRenaming where
 
 instance Monoid ModuleRenaming where
-    ModuleRenaming b rns `mappend` ModuleRenaming b' rns'
-        = ModuleRenaming (b || b') (rns ++ rns') -- ToDo: dedupe?
     mempty = ModuleRenaming False []
+    mappend = (Semi.<>)
+
+instance Semigroup ModuleRenaming where
+    ModuleRenaming b rns <> ModuleRenaming b' rns'
+        = ModuleRenaming (b || b') (rns ++ rns') -- TODO: dedupe?
 
 -- NB: parentheses are mandatory, because later we may extend this syntax
 -- to allow "hiding (A, B)" or other modifier words.
@@ -394,6 +395,7 @@ instance Text ModuleRenaming where
 -- The Library type
 
 data Library = Library {
+        libName :: String,
         exposedModules    :: [ModuleName],
         reexportedModules :: [ModuleReexport],
         requiredSignatures:: [ModuleName], -- ^ What sigs need implementations?
@@ -407,6 +409,7 @@ instance Binary Library
 
 instance Monoid Library where
   mempty = Library {
+    libName = mempty,
     exposedModules = mempty,
     reexportedModules = mempty,
     requiredSignatures = mempty,
@@ -414,7 +417,11 @@ instance Monoid Library where
     libExposed     = True,
     libBuildInfo   = mempty
   }
-  mappend a b = Library {
+  mappend = (Semi.<>)
+
+instance Semigroup Library where
+  a <> b = Library {
+    libName = combine' libName,
     exposedModules = combine exposedModules,
     reexportedModules = combine reexportedModules,
     requiredSignatures = combine requiredSignatures,
@@ -423,26 +430,31 @@ instance Monoid Library where
     libBuildInfo   = combine libBuildInfo
   }
     where combine field = field a `mappend` field b
+          combine' field = case (field a, field b) of
+                      ("","") -> ""
+                      ("", x) -> x
+                      (x, "") -> x
+                      (x, y) -> error $ "Ambiguous values for library field: '"
+                                  ++ x ++ "' and '" ++ y ++ "'"
 
 emptyLibrary :: Library
 emptyLibrary = mempty
 
--- |does this package have any libraries?
-hasLibs :: PackageDescription -> Bool
-hasLibs p = maybe False (buildable . libBuildInfo) (library p)
+-- | Does this package have a PUBLIC library?
+hasPublicLib :: PackageDescription -> Bool
+hasPublicLib p = any f (libraries p)
+    where f lib = buildable (libBuildInfo lib) &&
+                  libName lib == display (packageName (package p))
 
--- |'Maybe' version of 'hasLibs'
-maybeHasLibs :: PackageDescription -> Maybe Library
-maybeHasLibs p =
-   library p >>= \lib -> if buildable (libBuildInfo lib)
-                           then Just lib
-                           else Nothing
+-- | Does this package have any libraries?
+hasLibs :: PackageDescription -> Bool
+hasLibs p = any (buildable . libBuildInfo) (libraries p)
 
 -- |If the package description has a library section, call the given
 --  function with the library build info as argument.
 withLib :: PackageDescription -> (Library -> IO ()) -> IO ()
 withLib pkg_descr f =
-   traverse_ f (maybeHasLibs pkg_descr)
+   sequence_ [f lib | lib <- libraries pkg_descr, buildable (libBuildInfo lib)]
 
 -- | Get all the module names from the library (exposed and internal modules)
 -- which need to be compiled.  (This does not include reexports, which
@@ -499,12 +511,11 @@ data Executable = Executable {
 instance Binary Executable
 
 instance Monoid Executable where
-  mempty = Executable {
-    exeName    = mempty,
-    modulePath = mempty,
-    buildInfo  = mempty
-  }
-  mappend a b = Executable{
+  mempty = gmempty
+  mappend = (Semi.<>)
+
+instance Semigroup Executable where
+  a <> b = Executable{
     exeName    = combine' exeName,
     modulePath = combine modulePath,
     buildInfo  = combine buildInfo
@@ -589,8 +600,10 @@ instance Monoid TestSuite where
         testBuildInfo = mempty,
         testEnabled   = False
     }
+    mappend = (Semi.<>)
 
-    mappend a b = TestSuite {
+instance Semigroup TestSuite where
+    a <> b = TestSuite {
         testName      = combine' testName,
         testInterface = combine  testInterface,
         testBuildInfo = combine  testBuildInfo,
@@ -605,8 +618,11 @@ instance Monoid TestSuite where
 
 instance Monoid TestSuiteInterface where
     mempty  =  TestSuiteUnsupported (TestTypeUnknown mempty (Version [] []))
-    mappend a (TestSuiteUnsupported _) = a
-    mappend _ b                        = b
+    mappend = (Semi.<>)
+
+instance Semigroup TestSuiteInterface where
+    a <> (TestSuiteUnsupported _) = a
+    _ <> b                        = b
 
 emptyTestSuite :: TestSuite
 emptyTestSuite = mempty
@@ -722,8 +738,10 @@ instance Monoid Benchmark where
         benchmarkBuildInfo = mempty,
         benchmarkEnabled   = False
     }
+    mappend = (Semi.<>)
 
-    mappend a b = Benchmark {
+instance Semigroup Benchmark where
+    a <> b = Benchmark {
         benchmarkName      = combine' benchmarkName,
         benchmarkInterface = combine  benchmarkInterface,
         benchmarkBuildInfo = combine  benchmarkBuildInfo,
@@ -738,8 +756,11 @@ instance Monoid Benchmark where
 
 instance Monoid BenchmarkInterface where
     mempty  =  BenchmarkUnsupported (BenchmarkTypeUnknown mempty (Version [] []))
-    mappend a (BenchmarkUnsupported _) = a
-    mappend _ b                        = b
+    mappend = (Semi.<>)
+
+instance Semigroup BenchmarkInterface where
+    a <> (BenchmarkUnsupported _) = a
+    _ <> b                        = b
 
 emptyBenchmark :: Benchmark
 emptyBenchmark = mempty
@@ -800,6 +821,7 @@ data BuildInfo = BuildInfo {
         ldOptions         :: [String],  -- ^ options for linker
         pkgconfigDepends  :: [Dependency], -- ^ pkg-config packages that are used
         frameworks        :: [String], -- ^support frameworks for Mac OS X
+        extraFrameworkDirs:: [String], -- ^ extra locations to find frameworks.
         cSources          :: [FilePath],
         jsSources         :: [FilePath],
         hsSourceDirs      :: [FilePath], -- ^ where to look for the Haskell module hierarchy
@@ -832,63 +854,68 @@ instance Binary BuildInfo
 
 instance Monoid BuildInfo where
   mempty = BuildInfo {
-    buildable         = True,
-    buildTools        = [],
-    cppOptions        = [],
-    ccOptions         = [],
-    ldOptions         = [],
-    pkgconfigDepends  = [],
-    frameworks        = [],
-    cSources          = [],
-    jsSources         = [],
-    hsSourceDirs      = [],
-    otherModules      = [],
-    defaultLanguage   = Nothing,
-    otherLanguages    = [],
-    defaultExtensions = [],
-    otherExtensions   = [],
-    oldExtensions     = [],
-    extraLibs         = [],
-    extraGHCiLibs     = [],
-    extraLibDirs      = [],
-    includeDirs       = [],
-    includes          = [],
-    installIncludes   = [],
-    options           = [],
-    profOptions       = [],
-    sharedOptions     = [],
-    customFieldsBI    = [],
-    targetBuildDepends = [],
+    buildable           = True,
+    buildTools          = [],
+    cppOptions          = [],
+    ccOptions           = [],
+    ldOptions           = [],
+    pkgconfigDepends    = [],
+    frameworks          = [],
+    extraFrameworkDirs  = [],
+    cSources            = [],
+    jsSources           = [],
+    hsSourceDirs        = [],
+    otherModules        = [],
+    defaultLanguage     = Nothing,
+    otherLanguages      = [],
+    defaultExtensions   = [],
+    otherExtensions     = [],
+    oldExtensions       = [],
+    extraLibs           = [],
+    extraGHCiLibs       = [],
+    extraLibDirs        = [],
+    includeDirs         = [],
+    includes            = [],
+    installIncludes     = [],
+    options             = [],
+    profOptions         = [],
+    sharedOptions       = [],
+    customFieldsBI      = [],
+    targetBuildDepends  = [],
     targetBuildRenaming = Map.empty
   }
-  mappend a b = BuildInfo {
-    buildable         = buildable a && buildable b,
-    buildTools        = combine    buildTools,
-    cppOptions        = combine    cppOptions,
-    ccOptions         = combine    ccOptions,
-    ldOptions         = combine    ldOptions,
-    pkgconfigDepends  = combine    pkgconfigDepends,
-    frameworks        = combineNub frameworks,
-    cSources          = combineNub cSources,
-    jsSources         = combineNub jsSources,
-    hsSourceDirs      = combineNub hsSourceDirs,
-    otherModules      = combineNub otherModules,
-    defaultLanguage   = combineMby defaultLanguage,
-    otherLanguages    = combineNub otherLanguages,
-    defaultExtensions = combineNub defaultExtensions,
-    otherExtensions   = combineNub otherExtensions,
-    oldExtensions     = combineNub oldExtensions,
-    extraLibs         = combine    extraLibs,
-    extraGHCiLibs     = combine    extraGHCiLibs,
-    extraLibDirs      = combineNub extraLibDirs,
-    includeDirs       = combineNub includeDirs,
-    includes          = combineNub includes,
-    installIncludes   = combineNub installIncludes,
-    options           = combine    options,
-    profOptions       = combine    profOptions,
-    sharedOptions     = combine    sharedOptions,
-    customFieldsBI    = combine    customFieldsBI,
-    targetBuildDepends = combineNub targetBuildDepends,
+  mappend = (Semi.<>)
+
+instance Semigroup BuildInfo where
+  a <> b = BuildInfo {
+    buildable           = buildable a && buildable b,
+    buildTools          = combine    buildTools,
+    cppOptions          = combine    cppOptions,
+    ccOptions           = combine    ccOptions,
+    ldOptions           = combine    ldOptions,
+    pkgconfigDepends    = combine    pkgconfigDepends,
+    frameworks          = combineNub frameworks,
+    extraFrameworkDirs  = combineNub extraFrameworkDirs,
+    cSources            = combineNub cSources,
+    jsSources           = combineNub jsSources,
+    hsSourceDirs        = combineNub hsSourceDirs,
+    otherModules        = combineNub otherModules,
+    defaultLanguage     = combineMby defaultLanguage,
+    otherLanguages      = combineNub otherLanguages,
+    defaultExtensions   = combineNub defaultExtensions,
+    otherExtensions     = combineNub otherExtensions,
+    oldExtensions       = combineNub oldExtensions,
+    extraLibs           = combine    extraLibs,
+    extraGHCiLibs       = combine    extraGHCiLibs,
+    extraLibDirs        = combineNub extraLibDirs,
+    includeDirs         = combineNub includeDirs,
+    includes            = combineNub includes,
+    installIncludes     = combineNub installIncludes,
+    options             = combine    options,
+    profOptions         = combine    profOptions,
+    sharedOptions       = combine    sharedOptions,
+    customFieldsBI      = combine    customFieldsBI,
+    targetBuildDepends  = combineNub targetBuildDepends,
     targetBuildRenaming = combineMap targetBuildRenaming
   }
     where
@@ -904,7 +931,7 @@ emptyBuildInfo = mempty
 -- all buildable executables, test suites and benchmarks.  Useful for gathering
 -- dependencies.
 allBuildInfo :: PackageDescription -> [BuildInfo]
-allBuildInfo pkg_descr = [ bi | Just lib <- [library pkg_descr]
+allBuildInfo pkg_descr = [ bi | lib <- libraries pkg_descr
                               , let bi = libBuildInfo lib
                               , buildable bi ]
                       ++ [ bi | exe <- executables pkg_descr
@@ -939,10 +966,22 @@ usedExtensions :: BuildInfo -> [Extension]
 usedExtensions bi = oldExtensions bi
                  ++ defaultExtensions bi
 
-type HookedBuildInfo = (Maybe BuildInfo, [(String, BuildInfo)])
+-- Libraries live in a separate namespace, so must distinguish
+data ComponentName = CLibName   String
+                   | CExeName   String
+                   | CTestName  String
+                   | CBenchName String
+                   deriving (Eq, Generic, Ord, Read, Show)
+
+instance Binary ComponentName
+
+defaultLibName :: PackageIdentifier -> ComponentName
+defaultLibName pid = CLibName (display (pkgName pid))
+
+type HookedBuildInfo = [(ComponentName, BuildInfo)]
 
 emptyHookedBuildInfo :: HookedBuildInfo
-emptyHookedBuildInfo = (Nothing, [])
+emptyHookedBuildInfo = []
 
 -- |Select options for a particular Haskell compiler.
 hcOptions :: CompilerFlavor -> BuildInfo -> [String]
@@ -1098,28 +1137,38 @@ lowercase = map Char.toLower
 -- ------------------------------------------------------------
 
 updatePackageDescription :: HookedBuildInfo -> PackageDescription -> PackageDescription
-updatePackageDescription (mb_lib_bi, exe_bi) p
-    = p{ executables = updateExecutables exe_bi    (executables p)
-       , library     = updateLibrary     mb_lib_bi (library     p)
-       }
+updatePackageDescription hooked_bis p
+  = p{ executables = updateMany (CExeName . exeName)         updateExecutable (executables p)
+     , libraries   = updateMany (CLibName . libName)         updateLibrary    (libraries   p)
+     , benchmarks  = updateMany (CBenchName . benchmarkName) updateBenchmark  (benchmarks p)
+     , testSuites  = updateMany (CTestName . testName)       updateTestSuite  (testSuites p)
+     }
     where
-      updateLibrary :: Maybe BuildInfo -> Maybe Library -> Maybe Library
-      updateLibrary (Just bi) (Just lib) = Just (lib{libBuildInfo = bi `mappend` libBuildInfo lib})
-      updateLibrary Nothing   mb_lib     = mb_lib
-      updateLibrary (Just _)  Nothing    = Nothing
+      updateMany :: (a -> ComponentName) -- ^ get 'ComponentName' from @a@
+                 -> (BuildInfo -> a -> a) -- ^ @updateExecutable@, @updateLibrary@, etc
+                 -> [a]          -- ^list of components to update
+                 -> [a]          -- ^list with updated components
+      updateMany name update cs' = foldr (updateOne name update) cs' hooked_bis
 
-      updateExecutables :: [(String, BuildInfo)] -- ^[(exeName, new buildinfo)]
-                        -> [Executable]          -- ^list of executables to update
-                        -> [Executable]          -- ^list with exeNames updated
-      updateExecutables exe_bi' executables' = foldr updateExecutable executables' exe_bi'
+      updateOne :: (a -> ComponentName) -- ^ get 'ComponentName' from @a@
+                -> (BuildInfo -> a -> a) -- ^ @updateExecutable@, @updateLibrary@, etc
+                -> (ComponentName, BuildInfo) -- ^(name, new buildinfo)
+                -> [a]        -- ^list of components to update
+                -> [a]        -- ^list with name component updated
+      updateOne _ _ _                 []         = []
+      updateOne name_sel update hooked_bi'@(name,bi) (c:cs)
+        | name_sel c == name ||
+          -- Special case: an empty name means "please update the BuildInfo for
+          -- the public library, i.e. the one with the same name as the
+          -- package."  See 'parseHookedBuildInfo'.
+          name == CLibName "" && name_sel c == defaultLibName (package p)
+          = update bi c : cs
+        | otherwise          = c : updateOne name_sel update hooked_bi' cs
 
-      updateExecutable :: (String, BuildInfo) -- ^(exeName, new buildinfo)
-                       -> [Executable]        -- ^list of executables to update
-                       -> [Executable]        -- ^list with exeName updated
-      updateExecutable _                 []         = []
-      updateExecutable exe_bi'@(name,bi) (exe:exes)
-        | exeName exe == name = exe{buildInfo = bi `mappend` buildInfo exe} : exes
-        | otherwise           = exe : updateExecutable exe_bi' exes
+      updateExecutable bi exe = exe{buildInfo    = bi `mappend` buildInfo exe}
+      updateLibrary    bi lib = lib{libBuildInfo = bi `mappend` libBuildInfo lib}
+      updateBenchmark  bi ben = ben{benchmarkBuildInfo = bi `mappend` benchmarkBuildInfo ben}
+      updateTestSuite  bi test = test{testBuildInfo = bi `mappend` testBuildInfo test}
 
 -- ---------------------------------------------------------------------------
 -- The GenericPackageDescription type
@@ -1128,17 +1177,17 @@ data GenericPackageDescription =
     GenericPackageDescription {
         packageDescription :: PackageDescription,
         genPackageFlags       :: [Flag],
-        condLibrary        :: Maybe (CondTree ConfVar [Dependency] Library),
+        condLibraries      :: [(String, CondTree ConfVar [Dependency] Library)],
         condExecutables    :: [(String, CondTree ConfVar [Dependency] Executable)],
         condTestSuites     :: [(String, CondTree ConfVar [Dependency] TestSuite)],
         condBenchmarks     :: [(String, CondTree ConfVar [Dependency] Benchmark)]
       }
-    deriving (Show, Eq, Typeable, Data)
+    deriving (Show, Eq, Typeable, Data, Generic)
 
 instance Package GenericPackageDescription where
   packageId = packageId . packageDescription
 
---TODO: make PackageDescription an instance of Text.
+instance Binary GenericPackageDescription
 
 -- | A flag can represent a feature to be included, or a way of linking
 --   a target against its dependencies, or in fact whatever you can think of.
@@ -1148,7 +1197,9 @@ data Flag = MkFlag
     , flagDefault     :: Bool
     , flagManual      :: Bool
     }
-    deriving (Show, Eq, Typeable, Data)
+    deriving (Show, Eq, Typeable, Data, Generic)
+
+instance Binary Flag
 
 -- | A 'FlagName' is the name of a user-defined configuration flag
 newtype FlagName = FlagName String
@@ -1168,7 +1219,9 @@ data ConfVar = OS OS
              | Arch Arch
              | Flag FlagName
              | Impl CompilerFlavor VersionRange
-    deriving (Eq, Show, Typeable, Data)
+    deriving (Eq, Show, Typeable, Data, Generic)
+
+instance Binary ConfVar
 
 -- | A boolean expression parameterized over the variable type used.
 data Condition c = Var c
@@ -1176,12 +1229,33 @@ data Condition c = Var c
                  | CNot (Condition c)
                  | COr (Condition c) (Condition c)
                  | CAnd (Condition c) (Condition c)
-    deriving (Show, Eq, Typeable, Data)
+    deriving (Show, Eq, Typeable, Data, Generic)
 
+-- | Boolean negation of a 'Condition' value.
 cNot :: Condition a -> Condition a
 cNot (Lit b)  = Lit (not b)
 cNot (CNot c) = c
 cNot c        = CNot c
+
+-- | Boolean AND of two 'Condtion' values.
+cAnd :: Condition a -> Condition a -> Condition a
+cAnd (Lit False) _           = Lit False
+cAnd _           (Lit False) = Lit False
+cAnd (Lit True)  x           = x
+cAnd x           (Lit True)  = x
+cAnd x           y           = CAnd x y
+
+-- | Boolean OR of two 'Condition' values.
+cOr :: Eq v => Condition v -> Condition v -> Condition v
+cOr  (Lit True)  _           = Lit True
+cOr  _           (Lit True)  = Lit True
+cOr  (Lit False) x           = x
+cOr  x           (Lit False) = x
+cOr  c           (CNot d)
+  | c == d                   = Lit True
+cOr  (CNot c)    d
+  | c == d                   = Lit True
+cOr  x           y           = COr x y
 
 instance Functor Condition where
   f `fmap` Var c    = Var (f c)
@@ -1193,23 +1267,23 @@ instance Functor Condition where
 instance Foldable Condition where
   f `foldMap` Var c    = f c
   _ `foldMap` Lit _    = mempty
-  f `foldMap` CNot c   = foldMap f c
+  f `foldMap` CNot c   = Fold.foldMap f c
   f `foldMap` COr c d  = foldMap f c `mappend` foldMap f d
   f `foldMap` CAnd c d = foldMap f c `mappend` foldMap f d
 
 instance Traversable Condition where
   f `traverse` Var c    = Var `fmap` f c
   _ `traverse` Lit c    = pure $ Lit c
-  f `traverse` CNot c   = CNot `fmap` traverse f c
+  f `traverse` CNot c   = CNot `fmap` Trav.traverse f c
   f `traverse` COr c d  = COr  `fmap` traverse f c <*> traverse f d
   f `traverse` CAnd c d = CAnd `fmap` traverse f c <*> traverse f d
 
 instance Applicative Condition where
-  pure  = return
+  pure  = Var
   (<*>) = ap
 
 instance Monad Condition where
-  return = Var
+  return = AP.pure
   -- Terminating cases
   (>>=) (Lit x) _ = Lit x
   (>>=) (Var x) f = f x
@@ -1220,7 +1294,10 @@ instance Monad Condition where
 
 instance Monoid (Condition a) where
   mempty = Lit False
-  mappend = COr
+  mappend = (Semi.<>)
+
+instance Semigroup (Condition a) where
+  (<>) = COr
 
 instance Alternative Condition where
   empty = mempty
@@ -1230,6 +1307,8 @@ instance MonadPlus Condition where
   mzero = mempty
   mplus = mappend
 
+instance Binary c => Binary (Condition c)
+
 data CondTree v c a = CondNode
     { condTreeData        :: a
     , condTreeConstraints :: c
@@ -1237,4 +1316,6 @@ data CondTree v c a = CondNode
                               , CondTree v c a
                               , Maybe (CondTree v c a))]
     }
-    deriving (Show, Eq, Typeable, Data)
+    deriving (Show, Eq, Typeable, Data, Generic)
+
+instance (Binary v, Binary c, Binary a) => Binary (CondTree v c a)

@@ -27,9 +27,9 @@ import Distribution.Version
          ( Version(..), VersionRange, anyVersion
          , intersectVersionRanges, orLaterVersion
          , withinRange )
-import Distribution.InstalledPackageInfo (installedPackageId)
+import Distribution.InstalledPackageInfo (installedUnitId)
 import Distribution.Package
-         ( InstalledPackageId(..), PackageIdentifier(..), PackageId,
+         ( UnitId(..), PackageIdentifier(..), PackageId,
            PackageName(..), Package(..), packageName
          , packageVersion, Dependency(..) )
 import Distribution.PackageDescription
@@ -120,8 +120,37 @@ import System.Directory    ( doesDirectoryExist )
 import qualified System.Win32 as Win32
 #endif
 
+--TODO: The 'setupWrapper' and 'SetupScriptOptions' should be split into two
+-- parts: one that has no policy and just does as it's told with all the
+-- explicit options, and an optional initial part that applies certain
+-- policies (like if we should add the Cabal lib as a dep, and if so which
+-- version). This could be structured as an action that returns a fully
+-- elaborated 'SetupScriptOptions' containing no remaining policy choices.
+--
+-- See also the discussion at https://github.com/haskell/cabal/pull/3094
+
 data SetupScriptOptions = SetupScriptOptions {
+    -- | The version of the Cabal library to use (if 'useDependenciesExclusive'
+    -- is not set). A suitable version of the Cabal library must be installed
+    -- (or for some build-types be the one cabal-install was built with).
+    --
+    -- The version found also determines the version of the Cabal specification
+    -- that we us for talking to the Setup.hs, unless overridden by
+    -- 'useCabalSpecVersion'.
+    --
     useCabalVersion          :: VersionRange,
+
+    -- | This is the version of the Cabal specification that we believe that
+    -- this package uses. This affects the semantics and in particular the
+    -- Setup command line interface.
+    --
+    -- This is similar to 'useCabalVersion' but instead of probing the system
+    -- for a version of the /Cabal library/ you just say exactly which version
+    -- of the /spec/ we will use. Using this also avoid adding the Cabal
+    -- library as an additional dependency, so add it to 'useDependencies'
+    -- if needed.
+    --
+    useCabalSpecVersion      :: Maybe Version,
     useCompiler              :: Maybe Compiler,
     usePlatform              :: Maybe Platform,
     usePackageDB             :: PackageDBStack,
@@ -132,18 +161,30 @@ data SetupScriptOptions = SetupScriptOptions {
     useWorkingDir            :: Maybe FilePath,
     forceExternalSetupMethod :: Bool,
 
-    -- | List of dependencies to use when building Setup.hs
-    useDependencies :: [(InstalledPackageId, PackageId)],
+    -- | List of dependencies to use when building Setup.hs.
+    useDependencies :: [(UnitId, PackageId)],
 
     -- | Is the list of setup dependencies exclusive?
     --
-    -- This is here for legacy reasons. Before the introduction of the explicit
-    -- setup stanza in .cabal files we compiled Setup.hs scripts with all
-    -- packages in the environment visible, but we will needed to restrict
-    -- _some_ packages; in particular, we need to restrict the version of Cabal
-    -- that the setup script gets linked against (this was the only "dependency
-    -- constraint" that we had previously for Setup scripts).
+    -- When this is @False@, if we compile the Setup.hs script we do so with the
+    -- list in 'useDependencies' but all other packages in the environment are
+    -- also visible. A suitable version of @Cabal@ library (see
+    -- 'useCabalVersion') is also added to the list of dependencies, unless
+    -- 'useDependencies' already contains a Cabal dependency.
+    --
+    -- When @True@, only the 'useDependencies' packages are used, with other
+    -- packages in the environment hidden.
+    --
+    -- This feature is here to support the setup stanza in .cabal files that
+    -- specifies explicit (and exclusive) dependencies, as well as the old
+    -- style with no dependencies.
     useDependenciesExclusive :: Bool,
+
+    -- | Should we build the Setup.hs with CPP version macros available?
+    -- We turn this on when we have a setup stanza in .cabal that declares
+    -- explicit setup dependencies.
+    --
+    useVersionMacros         :: Bool,
 
     -- Used only by 'cabal clean' on Windows.
     --
@@ -174,12 +215,14 @@ data SetupScriptOptions = SetupScriptOptions {
 defaultSetupScriptOptions :: SetupScriptOptions
 defaultSetupScriptOptions = SetupScriptOptions {
     useCabalVersion          = anyVersion,
+    useCabalSpecVersion      = Nothing,
     useCompiler              = Nothing,
     usePlatform              = Nothing,
     usePackageDB             = [GlobalPackageDB, UserPackageDB],
     usePackageIndex          = Nothing,
     useDependencies          = [],
     useDependenciesExclusive = False,
+    useVersionMacros         = False,
     useProgramConfig         = emptyProgramConfiguration,
     useDistPref              = defaultDistPref,
     useLoggingHandle         = Nothing,
@@ -235,7 +278,9 @@ determineSetupMethod options buildType'
     -- between the self and internal setup methods, which are
     -- consistent with each other.
   | buildType' == Custom             = externalSetupMethod
-  | not (cabalVersion `withinRange`
+  | maybe False (cabalVersion /=)
+        (useCabalSpecVersion options)
+ || not (cabalVersion `withinRange`
          useCabalVersion options)    = externalSetupMethod
   | isJust (useLoggingHandle options)
     -- Forcing is done to use an external process e.g. due to parallel
@@ -304,7 +349,8 @@ selfExecSetupMethod verbosity options _pkg bt mkargs = do
 externalSetupMethod :: SetupMethod
 externalSetupMethod verbosity options pkg bt mkargs = do
   debug verbosity $ "Using external setup method with build-type " ++ show bt
-  debug verbosity $ "Using explicit dependencies: " ++ show (useDependenciesExclusive options)
+  debug verbosity $ "Using explicit dependencies: "
+    ++ show (useDependenciesExclusive options)
   createDirectoryIfMissingVerbose verbosity True setupDir
   (cabalLibVersion, mCabalLibInstalledPkgId, options') <- cabalLibVersionToUse
   debug verbosity $ "Using Cabal library version " ++ display cabalLibVersion
@@ -335,20 +381,26 @@ externalSetupMethod verbosity options pkg bt mkargs = do
       Nothing    -> getInstalledPackages verbosity
                     comp (usePackageDB options') conf
 
-  cabalLibVersionToUse :: IO (Version, (Maybe InstalledPackageId)
+  cabalLibVersionToUse :: IO (Version, (Maybe UnitId)
                              ,SetupScriptOptions)
-  cabalLibVersionToUse = do
-    savedVer <- savedVersion
-    case savedVer of
-      Just version | version `withinRange` useCabalVersion options
-        -> do updateSetupScript version bt
-              -- Does the previously compiled setup executable still exist and
-              -- is it up-to date?
-              useExisting <- canUseExistingSetup version
-              if useExisting
-                then return (version, Nothing, options)
-                else installedVersion
-      _ -> installedVersion
+  cabalLibVersionToUse =
+    case useCabalSpecVersion options of
+      Just version -> do
+        updateSetupScript version bt
+        writeFile setupVersionFile (show version ++ "\n")
+        return (version, Nothing, options)
+      Nothing  -> do
+        savedVer <- savedVersion
+        case savedVer of
+          Just version | version `withinRange` useCabalVersion options
+            -> do updateSetupScript version bt
+                  -- Does the previously compiled setup executable still exist
+                  -- and is it up-to date?
+                  useExisting <- canUseExistingSetup version
+                  if useExisting
+                    then return (version, Nothing, options)
+                    else installedVersion
+          _ -> installedVersion
     where
       -- This check duplicates the checks in 'getCachedSetupExecutable' /
       -- 'compileSetupExecutable'. Unfortunately, we have to perform it twice
@@ -364,7 +416,7 @@ externalSetupMethod verbosity options pkg bt mkargs = do
           (&&) <$> setupProgFile `existsAndIsMoreRecentThan` setupHs
                <*> setupProgFile `existsAndIsMoreRecentThan` setupVersionFile
 
-      installedVersion :: IO (Version, Maybe InstalledPackageId
+      installedVersion :: IO (Version, Maybe UnitId
                              ,SetupScriptOptions)
       installedVersion = do
         (comp,    conf,    options')  <- configureCompiler options
@@ -411,10 +463,8 @@ externalSetupMethod verbosity options pkg bt mkargs = do
     UnknownBuildType _ -> error "buildTypeScript UnknownBuildType"
 
   installedCabalVersion :: SetupScriptOptions -> Compiler -> ProgramConfiguration
-                        -> IO (Version, Maybe InstalledPackageId
+                        -> IO (Version, Maybe UnitId
                               ,SetupScriptOptions)
-  installedCabalVersion options' _ _ | packageName pkg == PackageName "Cabal" =
-    return (packageVersion pkg, Nothing, options')
   installedCabalVersion options' compiler conf = do
     index <- maybeGetInstalledPackages options' compiler conf
     let cabalDep   = Dependency (PackageName "Cabal") (useCabalVersion options')
@@ -426,7 +476,7 @@ externalSetupMethod verbosity options pkg bt mkargs = do
                  ++ " but no suitable version is installed."
       pkgs -> let ipkginfo = head . snd . bestVersion fst $ pkgs
               in return (packageVersion ipkginfo
-                        ,Just . installedPackageId $ ipkginfo, options'')
+                        ,Just . installedUnitId $ ipkginfo, options'')
 
   bestVersion :: (a -> Version) -> [a] -> a
   bestVersion f = firstMaximumBy (comparing (preference . f))
@@ -499,7 +549,7 @@ externalSetupMethod verbosity options pkg bt mkargs = do
   -- | Look up the setup executable in the cache; update the cache if the setup
   -- executable is not found.
   getCachedSetupExecutable :: SetupScriptOptions
-                           -> Version -> Maybe InstalledPackageId
+                           -> Version -> Maybe UnitId
                            -> IO FilePath
   getCachedSetupExecutable options' cabalLibVersion
                            maybeCabalLibInstalledPkgId = do
@@ -534,7 +584,7 @@ externalSetupMethod verbosity options pkg bt mkargs = do
   -- Currently this is GHC/GHCJS only. It should really be generalised.
   --
   compileSetupExecutable :: SetupScriptOptions
-                         -> Version -> Maybe InstalledPackageId -> Bool
+                         -> Version -> Maybe UnitId -> Bool
                          -> IO FilePath
   compileSetupExecutable options' cabalLibVersion maybeCabalLibInstalledPkgId
                          forceCompile = do
@@ -552,14 +602,26 @@ externalSetupMethod verbosity options pkg bt mkargs = do
           cabalDep = maybe [] (\ipkgid -> [(ipkgid, cabalPkgid)])
                               maybeCabalLibInstalledPkgId
 
-          -- We do a few things differently once packages opt-in and declare
-          -- a custom-settup stanza. In particular we then enforce the deps
-          -- specified, but also let the Setup.hs use the version macros.
-          newPedanticDeps     = useDependenciesExclusive options'
-          selectedDeps
-            | newPedanticDeps = useDependencies options'
-            | otherwise       = useDependencies options' ++ cabalDep
-          addRenaming (ipid, pid) = (ipid, pid, defaultRenaming)
+          -- With 'useDependenciesExclusive' we enforce the deps specified,
+          -- so only the given ones can be used. Otherwise we allow the use
+          -- of packages in the ambient environment, and add on a dep on the
+          -- Cabal library (unless 'useDependencies' already contains one).
+          --
+          -- With 'useVersionMacros' we use a version CPP macros .h file.
+          --
+          -- Both of these options should be enabled for packages that have
+          -- opted-in and declared a custom-settup stanza.
+          --
+          hasCabal (_, PackageIdentifier (PackageName "Cabal") _) = True
+          hasCabal _                                              = False
+
+          selectedDeps | useDependenciesExclusive options'
+                                   = useDependencies options'
+                       | otherwise = useDependencies options' ++
+                                     if any hasCabal (useDependencies options')
+                                     then []
+                                     else cabalDep
+          addRenaming (ipid, _) = (ipid, defaultRenaming)
           cppMacrosFile = setupDir </> "setup_macros.h"
           ghcOptions = mempty {
               ghcOptVerbosity       = Flag verbosity
@@ -569,17 +631,19 @@ externalSetupMethod verbosity options pkg bt mkargs = do
             , ghcOptObjDir          = Flag setupDir
             , ghcOptHiDir           = Flag setupDir
             , ghcOptSourcePathClear = Flag True
-            , ghcOptSourcePath      = toNubListR [workingDir]
+            , ghcOptSourcePath      = case bt of
+                                      Custom -> toNubListR [workingDir]
+                                      _      -> mempty
             , ghcOptPackageDBs      = usePackageDB options''
-            , ghcOptHideAllPackages = Flag newPedanticDeps
-            , ghcOptCabal           = Flag newPedanticDeps
+            , ghcOptHideAllPackages = Flag (useDependenciesExclusive options')
+            , ghcOptCabal           = Flag (useDependenciesExclusive options')
             , ghcOptPackages        = toNubListR $ map addRenaming selectedDeps
             , ghcOptCppIncludes     = toNubListR [ cppMacrosFile
-                                                 | newPedanticDeps ]
+                                                 | useVersionMacros options' ]
             , ghcOptExtra           = toNubListR extraOpts
             }
-      let ghcCmdLine = renderGhcOptions compiler ghcOptions
-      when newPedanticDeps $
+      let ghcCmdLine = renderGhcOptions compiler platform ghcOptions
+      when (useVersionMacros options') $
         rewriteFile cppMacrosFile (generatePackageVersionMacros
                                      [ pid | (_ipid, pid) <- selectedDeps ])
       case useLoggingHandle options of

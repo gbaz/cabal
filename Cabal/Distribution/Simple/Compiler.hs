@@ -53,22 +53,25 @@ module Distribution.Simple.Compiler (
         parmakeSupported,
         reexportedModulesSupported,
         renamingPackageFlagsSupported,
+        unifiedIPIDRequired,
         packageKeySupported,
+        unitIdSupported,
 
         -- * Support for profiling detail levels
         ProfDetailLevel(..),
         knownProfDetailLevels,
         flagToProfDetailLevel,
+        showProfDetailLevel,
   ) where
 
 import Distribution.Compiler
-import Distribution.Version (Version(..))
-import Distribution.Text (display)
-import Language.Haskell.Extension (Language(Haskell98), Extension)
-import Distribution.Simple.Utils (lowercase)
+import Distribution.Version
+import Distribution.Text
+import Language.Haskell.Extension
+import Distribution.Simple.Utils
+import Distribution.Compat.Binary
 
 import Control.Monad (liftM)
-import Distribution.Compat.Binary (Binary)
 import Data.List (nub)
 import qualified Data.Map as M (Map, lookup)
 import Data.Maybe (catMaybes, isNothing, listToMaybe)
@@ -89,7 +92,7 @@ data Compiler = Compiler {
         compilerProperties      :: M.Map String String
         -- ^ A key-value map for properties not covered by the above fields.
     }
-    deriving (Generic, Show, Read)
+    deriving (Eq, Generic, Show, Read)
 
 instance Binary Compiler
 
@@ -276,9 +279,17 @@ reexportedModulesSupported = ghcSupported "Support reexported-modules"
 renamingPackageFlagsSupported :: Compiler -> Bool
 renamingPackageFlagsSupported = ghcSupported "Support thinning and renaming package flags"
 
+-- | Does this compiler have unified IPIDs (so no package keys)
+unifiedIPIDRequired :: Compiler -> Bool
+unifiedIPIDRequired = ghcSupported "Requires unified installed package IDs"
+
 -- | Does this compiler support package keys?
 packageKeySupported :: Compiler -> Bool
 packageKeySupported = ghcSupported "Uses package keys"
+
+-- | Does this compiler support unit IDs?
+unitIdSupported :: Compiler -> Bool
+unitIdSupported = ghcSupported "Uses unit IDs"
 
 -- | Utility function for GHC only features
 ghcSupported :: String -> Compiler -> Bool
@@ -331,4 +342,13 @@ knownProfDetailLevels =
   , ("toplevel-functions", ["toplevel", "top"], ProfDetailToplevelFunctions)
   , ("all-functions",      ["all"],             ProfDetailAllFunctions)
   ]
+
+showProfDetailLevel :: ProfDetailLevel -> String
+showProfDetailLevel dl = case dl of
+    ProfDetailNone              -> "none"
+    ProfDetailDefault           -> "default"
+    ProfDetailExportedFunctions -> "exported-functions"
+    ProfDetailToplevelFunctions -> "toplevel-functions"
+    ProfDetailAllFunctions      -> "all-functions"
+    ProfDetailOther other       -> other
 

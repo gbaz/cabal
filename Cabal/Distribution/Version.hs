@@ -3,7 +3,28 @@
 #if __GLASGOW_HASKELL__ < 707
 {-# LANGUAGE StandaloneDeriving #-}
 #endif
+
+-- Hack approach to support bootstrapping.
+-- When MIN_VERSION_binary macro is available, use it. But it's not available
+-- during bootstrapping (or anyone else building Setup.hs directly). If the
+-- builder specifies -DMIN_VERSION_binary_0_8_0=1 or =0 then we respect that.
+-- Otherwise we pick a default based on GHC version: assume binary <0.8 when
+-- GHC < 8.0, and binary >=0.8 when GHC >= 8.0.
+#ifdef MIN_VERSION_binary
+#define MIN_VERSION_binary_0_8_0 MIN_VERSION_binary(0,8,0)
+#else
+#ifndef MIN_VERSION_binary_0_8_0
+#if __GLASGOW_HASKELL__ >= 800
+#define MIN_VERSION_binary_0_8_0 1
+#else
+#define MIN_VERSION_binary_0_8_0 0
+#endif
+#endif
+#endif
+
+#if !MIN_VERSION_binary_0_8_0
 {-# OPTIONS_GHC -fno-warn-orphans #-}
+#endif
 
 -----------------------------------------------------------------------------
 -- |
@@ -81,9 +102,10 @@ import Data.Typeable    ( Typeable )
 import Data.Version     ( Version(..) )
 import GHC.Generics     ( Generic )
 
-import Distribution.Text ( Text(..) )
+import Distribution.Text
 import qualified Distribution.Compat.ReadP as Parse
-import Distribution.Compat.ReadP ((+++))
+import Distribution.Compat.ReadP hiding (get)
+
 import qualified Text.PrettyPrint as Disp
 import Text.PrettyPrint ((<>), (<+>))
 import qualified Data.Char as Char (isDigit)
@@ -113,6 +135,7 @@ instance Binary VersionRange
 deriving instance Data Version
 #endif
 
+#if !(MIN_VERSION_binary_0_8_0)
 -- Deriving this instance from Generic gives trouble on GHC 7.2 because the
 -- Generic instance has to be standalone-derived. So, we hand-roll our own.
 -- We can't use a generic Binary instance on later versions because we must
@@ -123,14 +146,22 @@ instance Binary Version where
         tags <- get
         return $ Version br tags
     put (Version br tags) = put br >> put tags
+#endif
 
-{-# DEPRECATED AnyVersion "Use 'anyVersion', 'foldVersionRange' or 'asVersionIntervals'" #-}
-{-# DEPRECATED ThisVersion "use 'thisVersion', 'foldVersionRange' or 'asVersionIntervals'" #-}
-{-# DEPRECATED LaterVersion "use 'laterVersion', 'foldVersionRange' or 'asVersionIntervals'" #-}
-{-# DEPRECATED EarlierVersion "use 'earlierVersion', 'foldVersionRange' or 'asVersionIntervals'" #-}
-{-# DEPRECATED WildcardVersion "use 'anyVersion', 'foldVersionRange' or 'asVersionIntervals'" #-}
-{-# DEPRECATED UnionVersionRanges "use 'unionVersionRanges', 'foldVersionRange' or 'asVersionIntervals'" #-}
-{-# DEPRECATED IntersectVersionRanges "use 'intersectVersionRanges', 'foldVersionRange' or 'asVersionIntervals'" #-}
+{-# DeprecateD AnyVersion
+    "Use 'anyVersion', 'foldVersionRange' or 'asVersionIntervals'" #-}
+{-# DEPRECATED ThisVersion
+    "Use 'thisVersion', 'foldVersionRange' or 'asVersionIntervals'" #-}
+{-# DEPRECATED LaterVersion
+    "Use 'laterVersion', 'foldVersionRange' or 'asVersionIntervals'" #-}
+{-# DEPRECATED EarlierVersion
+    "Use 'earlierVersion', 'foldVersionRange' or 'asVersionIntervals'" #-}
+{-# DEPRECATED WildcardVersion
+    "Use 'anyVersion', 'foldVersionRange' or 'asVersionIntervals'" #-}
+{-# DEPRECATED UnionVersionRanges
+    "Use 'unionVersionRanges', 'foldVersionRange' or 'asVersionIntervals'" #-}
+{-# DEPRECATED IntersectVersionRanges
+    "Use 'intersectVersionRanges', 'foldVersionRange' or 'asVersionIntervals'"#-}
 
 -- | The version range @-any@. That is, a version range containing all
 -- versions.
@@ -216,7 +247,8 @@ intersectVersionRanges = IntersectVersionRanges
 --
 invertVersionRange :: VersionRange -> VersionRange
 invertVersionRange =
-    fromVersionIntervals . invertVersionIntervals . VersionIntervals . asVersionIntervals
+    fromVersionIntervals . invertVersionIntervals
+    . VersionIntervals . asVersionIntervals
 
 -- | The version range @== v.*@.
 --
@@ -698,10 +730,12 @@ invertVersionIntervals (VersionIntervals xs) =
       -- Empty interval set
       [] -> VersionIntervals [(noLowerBound, NoUpperBound)]
       -- Interval with no lower bound
-      ((lb, ub) : more) | lb == noLowerBound -> VersionIntervals $ invertVersionIntervals' ub more
+      ((lb, ub) : more) | lb == noLowerBound ->
+        VersionIntervals $ invertVersionIntervals' ub more
       -- Interval with a lower bound
       ((lb, ub) : more) ->
-          VersionIntervals $ (noLowerBound, invertLowerBound lb) : invertVersionIntervals' ub more
+          VersionIntervals $ (noLowerBound, invertLowerBound lb)
+          : invertVersionIntervals' ub more
     where
       -- Invert subsequent version intervals given the upper bound of
       -- the intervals already inverted.
@@ -744,8 +778,10 @@ instance Text VersionRange where
            (\v   -> (Disp.text ">=" <> disp v                   , 0))
            (\v   -> (Disp.text "<=" <> disp v                   , 0))
            (\v _ -> (Disp.text "==" <> dispWild v               , 0))
-           (\(r1, p1) (r2, p2) -> (punct 2 p1 r1 <+> Disp.text "||" <+> punct 2 p2 r2 , 2))
-           (\(r1, p1) (r2, p2) -> (punct 1 p1 r1 <+> Disp.text "&&" <+> punct 1 p2 r2 , 1))
+           (\(r1, p1) (r2, p2) ->
+             (punct 2 p1 r1 <+> Disp.text "||" <+> punct 2 p2 r2 , 2))
+           (\(r1, p1) (r2, p2) ->
+             (punct 1 p1 r1 <+> Disp.text "&&" <+> punct 1 p2 r2 , 1))
            (\(r, _)   -> (Disp.parens r, 0))
 
     where dispWild (Version b _) =

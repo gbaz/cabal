@@ -1,4 +1,3 @@
-{-# LANGUAGE CPP #-}
 {-# LANGUAGE PatternGuards #-}
 -----------------------------------------------------------------------------
 -- |
@@ -15,9 +14,7 @@ module Distribution.Lex (
  ) where
 
 import Data.Char (isSpace)
-#if __GLASGOW_HASKELL__ < 710
-import Data.Monoid
-#endif
+import Distribution.Compat.Semigroup as Semi
 
 newtype DList a = DList ([a] -> [a])
 
@@ -29,7 +26,10 @@ singleton a = DList (a:)
 
 instance Monoid (DList a) where
   mempty = DList id
-  DList a `mappend` DList b = DList (a . b)
+  mappend = (Semi.<>)
+
+instance Semigroup (DList a) where
+  DList a <> DList b = DList (a . b)
 
 tokenizeQuotedWords :: String -> [String]
 tokenizeQuotedWords = filter (not . null) . go False mempty

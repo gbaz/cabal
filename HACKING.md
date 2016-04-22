@@ -34,7 +34,7 @@ Building Cabal from git cloned sources and running the tests
 _The steps below will make use of sandboxes for building. The process might be
 somewhat different when you do not want to use sandboxes._
 
-Building Cabal from from source requires the following:
+Building Cabal from source requires the following:
 
 * Glorious/Glasgow Haskell Compiler (ghc).
 * An existing (relatively recent) `cabal` binary (e.g. obtained as part of the
@@ -70,7 +70,7 @@ To build and test the `Cabal` library, do:
     we cannot use `cabal` for the next steps;
     we need to use Setup instead.
     So, compile Setup.hs:
-    
+
     ~~~~
     ghc --make -threaded Setup.hs
     ~~~~
@@ -89,7 +89,7 @@ To build and test the `Cabal` library, do:
     ~~~~
     ~/MyHaskellCode/cabal/Cabal/.cabal-sandbox/$SOMESTUFF-packages.conf.d
     ~~~~
-    
+
     (or, as a relative path with my setup:)
 
     ~~~~
@@ -98,7 +98,7 @@ To build and test the `Cabal` library, do:
 
     We will refer to this as `PACKAGEDB`.
 
-5. Configure and build Cabal, and run all tests.  (Note that many of the package tests require shared libraries, which are not provided by GHC >= 7.8 on Windows: https://ghc.haskell.org/trac/ghc/ticket/8228)
+5. Configure and build Cabal, and run all tests:
 
     ~~~~
     ./Setup configure --enable-tests --package-db=$PACKAGEDB
@@ -128,6 +128,18 @@ identical; only the first two steps are different:
 (In addition, the absolute sandbox path will be slightly different
 because we have to use the `cabal-install` sandbox, not the Cabal one. If you
 use the relative path, you are set.)
+
+Coding Conventions
+------------------
+
+Use spaces, not tabs. Use lines no longer than 80 characters. If you modify a
+file, please follow the style conventions used in that file. When you add a new
+top-level definition, please also add a Haddock comment. Use explicit import
+lists for third-party and standard library imports. Use of GHC extensions is
+allowed (except Template Haskell), provided that the dependencies policy is
+respected. In general, try to adhere to [this style guide][guide].
+
+[guide]: https://github.com/tibbe/haskell-style-guide/blob/master/haskell-style.md
 
 Dependencies policy
 -------------------

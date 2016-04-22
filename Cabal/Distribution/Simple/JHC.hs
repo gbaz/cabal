@@ -16,40 +16,23 @@ module Distribution.Simple.JHC (
         installLib, installExe
  ) where
 
-import Distribution.PackageDescription as PD
-       ( PackageDescription(..), BuildInfo(..), Executable(..)
-       , Library(..), libModules, hcOptions, usedExtensions )
+import Distribution.PackageDescription as PD hiding (Flag)
 import Distribution.InstalledPackageInfo
-         ( emptyInstalledPackageInfo, )
 import qualified Distribution.InstalledPackageInfo as InstalledPackageInfo
 import Distribution.Simple.PackageIndex (InstalledPackageIndex)
 import qualified Distribution.Simple.PackageIndex as PackageIndex
 import Distribution.Simple.LocalBuildInfo
-         ( LocalBuildInfo(..), ComponentLocalBuildInfo(..) )
 import Distribution.Simple.BuildPaths
-                                ( autogenModulesDir, exeExtension )
 import Distribution.Simple.Compiler
-         ( CompilerFlavor(..), CompilerId(..), Compiler(..), AbiTag(..)
-         , PackageDBStack, Flag, languageToFlags, extensionsToFlags )
 import Language.Haskell.Extension
-         ( Language(Haskell98), Extension(..), KnownExtension(..))
 import Distribution.Simple.Program
-         ( ConfiguredProgram(..), jhcProgram, ProgramConfiguration
-         , userMaybeSpecifyPath, requireProgramVersion, lookupProgram
-         , rawSystemProgram, rawSystemProgramStdoutConf )
 import Distribution.Version
-         ( Version(..), orLaterVersion )
 import Distribution.Package
-         ( Package(..), InstalledPackageId(InstalledPackageId),
-           pkgName, pkgVersion, )
 import Distribution.Simple.Utils
-        ( createDirectoryIfMissingVerbose, writeFileAtomic
-        , installOrdinaryFile, installExecutableFile
-        , intercalate )
-import System.FilePath          ( (</>) )
 import Distribution.Verbosity
 import Distribution.Text
-         ( Text(parse), display )
+
+import System.FilePath          ( (</>) )
 import Distribution.Compat.ReadP
     ( readP_to_S, string, skipSpaces )
 import Distribution.System ( Platform )
@@ -57,7 +40,6 @@ import Distribution.System ( Platform )
 import Data.List                ( nub )
 import Data.Char                ( isSpace )
 import qualified Data.Map as M  ( empty )
-import Data.Maybe               ( fromMaybe )
 
 import qualified Data.ByteString.Lazy.Char8 as BS.Char8
 
@@ -116,8 +98,7 @@ getInstalledPackages verbosity _packageDBs conf = do
    return $
       PackageIndex.fromList $
       map (\p -> emptyInstalledPackageInfo {
-                    InstalledPackageInfo.installedPackageId =
-                       InstalledPackageId (display p),
+                    InstalledPackageInfo.installedUnitId = mkLegacyUnitId p,
                     InstalledPackageInfo.sourcePackageId = p
                  }) $
       concatMap parseLine $
@@ -162,7 +143,7 @@ constructJHCCmdLine lbi bi clbi _odir verbosity =
      ++ extensionsToFlags (compiler lbi) (usedExtensions bi)
      ++ ["--noauto","-i-"]
      ++ concat [["-i", l] | l <- nub (hsSourceDirs bi)]
-     ++ ["-i", autogenModulesDir lbi]
+     ++ ["-i", autogenModulesDir lbi clbi]
      ++ ["-optc" ++ opt | opt <- PD.ccOptions bi]
      -- It would be better if JHC would accept package names with versions,
      -- but JHC-0.7.2 doesn't accept this.
@@ -173,7 +154,10 @@ constructJHCCmdLine lbi bi clbi _odir verbosity =
 jhcPkgConf :: PackageDescription -> String
 jhcPkgConf pd =
   let sline name sel = name ++ ": "++sel pd
-      lib = fromMaybe (error "no library available") . library
+      lib pd' = case libraries pd' of
+                [lib'] -> lib'
+                [] -> error "no library available"
+                _ -> error "JHC does not support multiple libraries (yet)"
       comma = intercalate "," . map display
   in unlines [sline "name" (display . pkgName . packageId)
              ,sline "version" (display . pkgVersion . packageId)
@@ -181,8 +165,16 @@ jhcPkgConf pd =
              ,sline "hidden-modules" (comma . otherModules . libBuildInfo . lib)
              ]
 
-installLib :: Verbosity -> FilePath -> FilePath -> PackageDescription -> Library -> IO ()
-installLib verb dest build_dir pkg_descr _ = do
+installLib :: Verbosity
+           -> LocalBuildInfo
+           -> FilePath
+           -> FilePath
+           -> FilePath
+           -> PackageDescription
+           -> Library
+           -> ComponentLocalBuildInfo
+           -> IO ()
+installLib verb _lbi dest _dyn_dest build_dir pkg_descr _lib _clbi = do
     let p = display (packageId pkg_descr)++".hl"
     createDirectoryIfMissingVerbose verb True dest
     installOrdinaryFile verb (build_dir </> p) (dest </> p)

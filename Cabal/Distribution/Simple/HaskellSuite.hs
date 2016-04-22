@@ -1,10 +1,6 @@
-{-# LANGUAGE CPP #-}
 module Distribution.Simple.HaskellSuite where
 
 import Control.Monad
-#if __GLASGOW_HASKELL__ < 710
-import Control.Applicative
-#endif
 import Data.Maybe
 import Data.Version
 import qualified Data.Map as M (empty)
@@ -24,7 +20,6 @@ import Distribution.System (Platform)
 import Distribution.Compat.Exception
 import Language.Haskell.Extension
 import Distribution.Simple.Program.Builtin
-  (haskellSuiteProgram, haskellSuitePkgProgram)
 
 configure
   :: Verbosity -> Maybe FilePath -> Maybe FilePath
@@ -60,7 +55,7 @@ configure verbosity mbHcPath hcPkgPath conf0 = do
       let
         haskellSuiteProgram' =
           haskellSuiteProgram
-            { programFindLocation = \v _p -> findProgramLocation v hcPath }
+            { programFindLocation = \v p -> findProgramOnSearchPath v p hcPath }
 
       -- NB: cannot call requireProgram right away — it'd think that
       -- the program is already configured and won't reconfigure it again.
@@ -106,7 +101,7 @@ getCompilerVersion verbosity prog = do
 getExtensions :: Verbosity -> ConfiguredProgram -> IO [(Extension, Compiler.Flag)]
 getExtensions verbosity prog = do
   extStrs <-
-    lines <$>
+    lines `fmap`
     rawSystemStdout verbosity (programPath prog) ["--supported-extensions"]
   return
     [ (ext, "-X" ++ display ext) | Just ext <- map simpleParse extStrs ]
@@ -114,7 +109,7 @@ getExtensions verbosity prog = do
 getLanguages :: Verbosity -> ConfiguredProgram -> IO [(Language, Compiler.Flag)]
 getLanguages verbosity prog = do
   langStrs <-
-    lines <$>
+    lines `fmap`
     rawSystemStdout verbosity (programPath prog) ["--supported-languages"]
   return
     [ (ext, "-G" ++ display ext) | Just ext <- map simpleParse langStrs ]
@@ -170,7 +165,7 @@ buildLib verbosity pkg_descr lbi lib clbi = do
   runDbProgram verbosity haskellSuiteProgram conf $
     [ "compile", "--build-dir", odir ] ++
     concat [ ["-i", d] | d <- srcDirs ] ++
-    concat [ ["-I", d] | d <- [autogenModulesDir lbi, odir] ++ includeDirs bi ] ++
+    concat [ ["-I", d] | d <- [autogenModulesDir lbi clbi, odir] ++ includeDirs bi ] ++
     [ packageDbOpt pkgDb | pkgDb <- dbStack ] ++
     [ "--package-name", display pkgid ] ++
     concat [ ["--package-id", display ipkgid ]
@@ -190,8 +185,9 @@ installLib
   -> FilePath  -- ^Build location
   -> PackageDescription
   -> Library
+  -> ComponentLocalBuildInfo
   -> IO ()
-installLib verbosity lbi targetDir dynlibTargetDir builtDir pkg lib = do
+installLib verbosity lbi targetDir dynlibTargetDir builtDir pkg lib _clbi = do
   let conf = withPrograms lbi
   runDbProgram verbosity haskellSuitePkgProgram conf $
     [ "install-library"
@@ -203,14 +199,12 @@ installLib verbosity lbi targetDir dynlibTargetDir builtDir pkg lib = do
 
 registerPackage
   :: Verbosity
-  -> InstalledPackageInfo
-  -> PackageDescription
-  -> LocalBuildInfo
-  -> Bool
+  -> ProgramConfiguration
   -> PackageDBStack
+  -> InstalledPackageInfo
   -> IO ()
-registerPackage verbosity installedPkgInfo _pkg lbi _inplace packageDbs = do
-  (hspkg, _) <- requireProgram verbosity haskellSuitePkgProgram (withPrograms lbi)
+registerPackage verbosity progdb packageDbs installedPkgInfo = do
+  (hspkg, _) <- requireProgram verbosity haskellSuitePkgProgram progdb
 
   runProgramInvocation verbosity $
     (programInvocation hspkg

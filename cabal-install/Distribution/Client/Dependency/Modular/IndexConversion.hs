@@ -1,14 +1,12 @@
-module Distribution.Client.Dependency.Modular.IndexConversion (
-    convPIs
-    -- * TODO: The following don't actually seem to be used anywhere?
-  , convIPI
-  , convSPI
-  , convPI
-  ) where
+module Distribution.Client.Dependency.Modular.IndexConversion
+    ( convPIs
+    ) where
 
 import Data.List as L
 import Data.Map as M
 import Data.Maybe
+import Data.Monoid as Mon
+import Data.Set as S
 import Prelude hiding (pi)
 
 import qualified Distribution.Client.PackageIndex as CI
@@ -18,6 +16,7 @@ import Distribution.Compiler
 import Distribution.InstalledPackageInfo as IPI
 import Distribution.Package                          -- from Cabal
 import Distribution.PackageDescription as PD         -- from Cabal
+import Distribution.PackageDescription.Configuration as PDC
 import qualified Distribution.Simple.PackageIndex as SI
 import Distribution.System
 
@@ -40,7 +39,7 @@ import Distribution.Client.Dependency.Modular.Version
 -- fix the problem there, so for now, shadowing is only activated if
 -- explicitly requested.
 convPIs :: OS -> Arch -> CompilerInfo -> Bool -> Bool ->
-           SI.InstalledPackageIndex -> CI.PackageIndex SourcePackage -> Index
+           SI.InstalledPackageIndex -> CI.PackageIndex (SourcePackage loc) -> Index
 convPIs os arch comp sip strfl iidx sidx =
   mkIndex (convIPI' sip iidx ++ convSPI' os arch comp strfl sidx)
 
@@ -59,21 +58,18 @@ convIPI' sip idx =
     shadow (pn, i, PInfo fdeps fds _) | sip = (pn, i, PInfo fdeps fds (Just Shadowed))
     shadow x                                = x
 
-convIPI :: Bool -> SI.InstalledPackageIndex -> Index
-convIPI sip = mkIndex . convIPI' sip
-
 -- | Convert a single installed package into the solver-specific format.
 convIP :: SI.InstalledPackageIndex -> InstalledPackageInfo -> (PN, I, PInfo)
 convIP idx ipi =
-  let ipid = IPI.installedPackageId ipi
-      i = I (pkgVersion (sourcePackageId ipi)) (Inst ipid)
-      pn = pkgName (sourcePackageId ipi)
-  in  case mapM (convIPId pn idx) (IPI.depends ipi) of
+  case mapM (convIPId pn idx) (IPI.depends ipi) of
         Nothing  -> (pn, i, PInfo []            M.empty (Just Broken))
         Just fds -> (pn, i, PInfo (setComp fds) M.empty Nothing)
  where
   -- We assume that all dependencies of installed packages are _library_ deps
-  setComp = setCompFlaggedDeps ComponentLib
+  ipid = IPI.installedUnitId ipi
+  i = I (pkgVersion (sourcePackageId ipi)) (Inst ipid)
+  pn = pkgName (sourcePackageId ipi)
+  setComp = setCompFlaggedDeps (ComponentLib (unPackageName pn))
 -- TODO: Installed packages should also store their encapsulations!
 
 -- | Convert dependencies specified by an installed package id into
@@ -82,9 +78,9 @@ convIP idx ipi =
 -- May return Nothing if the package can't be found in the index. That
 -- indicates that the original package having this dependency is broken
 -- and should be ignored.
-convIPId :: PN -> SI.InstalledPackageIndex -> InstalledPackageId -> Maybe (FlaggedDep () PN)
+convIPId :: PN -> SI.InstalledPackageIndex -> UnitId -> Maybe (FlaggedDep () PN)
 convIPId pn' idx ipid =
-  case SI.lookupInstalledPackageId idx ipid of
+  case SI.lookupUnitId idx ipid of
     Nothing  -> Nothing
     Just ipi -> let i = I (pkgVersion (sourcePackageId ipi)) (Inst ipid)
                     pn = pkgName (sourcePackageId ipi)
@@ -93,15 +89,11 @@ convIPId pn' idx ipid =
 -- | Convert a cabal-install source package index to the simpler,
 -- more uniform index format of the solver.
 convSPI' :: OS -> Arch -> CompilerInfo -> Bool ->
-            CI.PackageIndex SourcePackage -> [(PN, I, PInfo)]
+            CI.PackageIndex (SourcePackage loc) -> [(PN, I, PInfo)]
 convSPI' os arch cinfo strfl = L.map (convSP os arch cinfo strfl) . CI.allPackages
 
-convSPI :: OS -> Arch -> CompilerInfo -> Bool ->
-           CI.PackageIndex SourcePackage -> Index
-convSPI os arch cinfo strfl = mkIndex . convSPI' os arch cinfo strfl
-
 -- | Convert a single source package into the solver-specific format.
-convSP :: OS -> Arch -> CompilerInfo -> Bool -> SourcePackage -> (PN, I, PInfo)
+convSP :: OS -> Arch -> CompilerInfo -> Bool -> SourcePackage loc -> (PN, I, PInfo)
 convSP os arch cinfo strfl (SourcePackage (PackageIdentifier pn pv) gpd _ _pl) =
   let i = I pv InRepo
   in  (pn, i, convGPD os arch cinfo strfl (PI pn i) gpd)
@@ -113,24 +105,84 @@ convSP os arch cinfo strfl (SourcePackage (PackageIdentifier pn pv) gpd _ _pl) =
 -- | Convert a generic package description to a solver-specific 'PInfo'.
 convGPD :: OS -> Arch -> CompilerInfo -> Bool ->
            PI PN -> GenericPackageDescription -> PInfo
-convGPD os arch comp strfl pi
+convGPD os arch cinfo strfl pi@(PI pn _)
         (GenericPackageDescription pkg flags libs exes tests benchs) =
   let
     fds  = flagInfo strfl flags
-    conv = convCondTree os arch comp pi fds (const True)
-  in
-    PInfo
-      (maybe []    (conv ComponentLib                       ) libs    ++
-       maybe []    (convSetupBuildInfo pi)    (setupBuildInfo pkg)    ++
-       concatMap   (\(nm, ds) -> conv (ComponentExe nm)   ds) exes    ++
-      prefix (Stanza (SN pi TestStanzas))
-        (L.map     (\(nm, ds) -> conv (ComponentTest nm)  ds) tests)  ++
-      prefix (Stanza (SN pi BenchStanzas))
-        (L.map     (\(nm, ds) -> conv (ComponentBench nm) ds) benchs))
-      fds
-      Nothing
 
-prefix :: (FlaggedDeps comp qpn -> FlaggedDep comp' qpn) -> [FlaggedDeps comp qpn] -> FlaggedDeps comp' qpn
+    -- | We have to be careful to filter out dependencies on
+    -- internal libraries, since they don't refer to real packages
+    -- and thus cannot actually be solved over.  We'll do this
+    -- by creating a set of package names which are "internal"
+    -- and dropping them as we convert.
+    ipns = S.fromList [ PackageName nm
+                      | (nm, _) <- libs
+                      -- Don't include the true package name;
+                      -- qualification could make this relevant.
+                      -- TODO: Can we qualify over internal
+                      -- dependencies? Not for now!
+                      , PackageName nm /= pn ]
+
+    conv :: Mon.Monoid a => Component -> (a -> BuildInfo) ->
+            CondTree ConfVar [Dependency] a -> FlaggedDeps Component PN
+    conv comp getInfo = convCondTree os arch cinfo pi fds comp getInfo ipns .
+                        PDC.addBuildableCondition getInfo
+
+    flagged_deps
+        = concatMap (\(nm, ds) -> conv (ComponentLib nm)   libBuildInfo       ds) libs
+       ++ concatMap (\(nm, ds) -> conv (ComponentExe nm)   buildInfo          ds) exes
+       ++ prefix (Stanza (SN pi TestStanzas))
+            (L.map  (\(nm, ds) -> conv (ComponentTest nm)  testBuildInfo      ds) tests)
+       ++ prefix (Stanza (SN pi BenchStanzas))
+            (L.map  (\(nm, ds) -> conv (ComponentBench nm) benchmarkBuildInfo ds) benchs)
+       ++ maybe []    (convSetupBuildInfo pi)    (setupBuildInfo pkg)
+
+  in
+    PInfo flagged_deps fds Nothing
+
+-- With convenience libraries, we have to do some work.  Imagine you
+-- have the following Cabal file:
+--
+--      name: foo
+--      library foo-internal
+--          build-depends: external-a
+--      library
+--          build-depends: foo-internal, external-b
+--      library foo-helper
+--          build-depends: foo, external-c
+--      test-suite foo-tests
+--          build-depends: foo-helper, external-d
+--
+-- What should the final flagged dependency tree be?  Ideally, it
+-- should look like this:
+--
+--      [ Simple (Dep external-a) (Library foo-internal)
+--      , Simple (Dep external-b) (Library foo)
+--      , Stanza (SN foo TestStanzas) $
+--          [ Simple (Dep external-c) (Library foo-helper)
+--          , Simple (Dep external-d) (TestSuite foo-tests) ]
+--      ]
+--
+-- There are two things to note:
+--
+--      1. First, we eliminated the "local" dependencies foo-internal
+--      and foo-helper.  This are implicitly assumed to refer to "foo"
+--      so we don't need to have them around.  If you forget this,
+--      Cabal will then try to pick a version for "foo-helper" but
+--      no such package exists (this is the cost of overloading
+--      build-depends to refer to both packages and components.)
+--
+--      2. Second, it is more precise to have external-c be qualified
+--      by a test stanza, since foo-helper only needs to be built if
+--      your are building the test suite (and not the main library).
+--      If you omit it, Cabal will always attempt to depsolve for
+--      foo-helper even if you aren't building the test suite.
+
+-- | Create a flagged dependency tree from a list @fds@ of flagged
+-- dependencies, using @f@ to form the tree node (@f@ will be
+-- something like @Stanza sn@).
+prefix :: (FlaggedDeps comp qpn -> FlaggedDep comp' qpn)
+       -> [FlaggedDeps comp qpn] -> FlaggedDeps comp' qpn
 prefix _ []  = []
 prefix f fds = [f (concat fds)]
 
@@ -139,17 +191,37 @@ prefix f fds = [f (concat fds)]
 flagInfo :: Bool -> [PD.Flag] -> FlagInfo
 flagInfo strfl = M.fromList . L.map (\ (MkFlag fn _ b m) -> (fn, FInfo b m (not (strfl || m))))
 
--- | Convert condition trees to flagged dependencies.
-convCondTree :: OS -> Arch -> CompilerInfo -> PI PN -> FlagInfo ->
-                (a -> Bool) -> -- how to detect if a branch is active
-                Component ->
-                CondTree ConfVar [Dependency] a -> FlaggedDeps Component PN
-convCondTree os arch cinfo pi@(PI pn _) fds p comp (CondNode info ds branches)
-  | p info    = L.map (\d -> D.Simple (convDep pn d) comp) ds  -- unconditional dependencies
-              ++ concatMap (convBranch os arch cinfo pi fds p comp) branches
-  | otherwise = []
+-- | Internal package names, which should not be interpreted as true
+-- dependencies.
+type IPNs = Set PN
 
--- | Branch interpreter.
+-- | Convenience function to delete a 'FlaggedDep' if it's
+-- for a 'PN' that isn't actually real.
+filterIPNs :: IPNs -> Dependency -> FlaggedDep Component PN -> FlaggedDeps Component PN
+filterIPNs ipns (Dependency pn _) fd
+    | S.notMember pn ipns = [fd]
+    | otherwise           = []
+
+-- | Convert condition trees to flagged dependencies.  Mutually
+-- recursive with 'convBranch'.  See 'convBranch' for an explanation
+-- of all arguments preceeding the input 'CondTree'.
+convCondTree :: OS -> Arch -> CompilerInfo -> PI PN -> FlagInfo ->
+                Component ->
+                (a -> BuildInfo) ->
+                IPNs ->
+                CondTree ConfVar [Dependency] a -> FlaggedDeps Component PN
+convCondTree os arch cinfo pi@(PI pn _) fds comp getInfo ipns (CondNode info ds branches) =
+                 concatMap
+                    (\d -> filterIPNs ipns d (D.Simple (convDep pn d) comp))
+                    ds  -- unconditional package dependencies
+              ++ L.map (\e -> D.Simple (Ext  e) comp) (PD.allExtensions bi) -- unconditional extension dependencies
+              ++ L.map (\l -> D.Simple (Lang l) comp) (PD.allLanguages  bi) -- unconditional language dependencies
+              ++ L.map (\(Dependency pkn vr) -> D.Simple (Pkg pkn vr) comp) (PD.pkgconfigDepends bi) -- unconditional pkg-config dependencies
+              ++ concatMap (convBranch os arch cinfo pi fds comp getInfo ipns) branches
+  where
+    bi = getInfo info
+
+-- | Branch interpreter.  Mutually recursive with 'convCondTree'.
 --
 -- Here, we try to simplify one of Cabal's condition tree branches into the
 -- solver's flagged dependency format, which is weaker. Condition trees can
@@ -157,16 +229,40 @@ convCondTree os arch cinfo pi@(PI pn _) fds p comp (CondNode info ds branches)
 -- flags (such as architecture, or compiler flavour). We try to evaluate the
 -- special flags and subsequently simplify to a tree that only depends on
 -- simple flag choices.
+--
+-- This function takes a number of arguments:
+--
+--      1. Some pre dependency-solving known information ('OS', 'Arch',
+--         'CompilerInfo') for @os()@, @arch()@ and @impl()@ variables,
+--
+--      2. The package instance @'PI' 'PN'@ which this condition tree
+--         came from, so that we can correctly associate @flag()@
+--         variables with the correct package name qualifier,
+--
+--      3. The flag defaults 'FlagInfo' so that we can populate
+--         'Flagged' dependencies with 'FInfo',
+--
+--      4. The name of the component 'Component' so we can record where
+--         the fine-grained information about where the component came
+--         from (see 'convCondTree'), and
+--
+--      5. A selector to extract the 'BuildInfo' from the leaves of
+--         the 'CondTree' (which actually contains the needed
+--         dependency information.)
+--
+--      6. The set of package names which should be considered internal
+--         dependencies, and thus not handled as dependencies.
 convBranch :: OS -> Arch -> CompilerInfo ->
               PI PN -> FlagInfo ->
-              (a -> Bool) -> -- how to detect if a branch is active
               Component ->
+              (a -> BuildInfo) ->
+              IPNs ->
               (Condition ConfVar,
                CondTree ConfVar [Dependency] a,
                Maybe (CondTree ConfVar [Dependency] a)) -> FlaggedDeps Component PN
-convBranch os arch cinfo pi@(PI pn _) fds p comp (c', t', mf') =
-  go c' (          convCondTree os arch cinfo pi fds p comp   t')
-        (maybe [] (convCondTree os arch cinfo pi fds p comp) mf')
+convBranch os arch cinfo pi@(PI pn _) fds comp getInfo ipns (c', t', mf') =
+  go c' (          convCondTree os arch cinfo pi fds comp getInfo ipns   t')
+        (maybe [] (convCondTree os arch cinfo pi fds comp getInfo ipns) mf')
   where
     go :: Condition ConfVar ->
           FlaggedDeps Component PN -> FlaggedDeps Component PN -> FlaggedDeps Component PN
@@ -213,10 +309,6 @@ convBranch os arch cinfo pi@(PI pn _) fds p comp (c', t', mf') =
 -- | Convert a Cabal dependency to a solver-specific dependency.
 convDep :: PN -> Dependency -> Dep PN
 convDep pn' (Dependency pn vr) = Dep pn (Constrained [(vr, Goal (P pn') [])])
-
--- | Convert a Cabal package identifier to a solver-specific dependency.
-convPI :: PN -> PackageIdentifier -> Dep PN
-convPI pn' (PackageIdentifier pn v) = Dep pn (Constrained [(eqVR v, Goal (P pn') [])])
 
 -- | Convert setup dependencies
 convSetupBuildInfo :: PI PN -> SetupBuildInfo -> FlaggedDeps Component PN

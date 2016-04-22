@@ -2,26 +2,22 @@ module Distribution.Simple.Test.ExeV10
        ( runTest
        ) where
 
-import Distribution.Compat.CreatePipe ( createPipe )
-import Distribution.Compat.Environment ( getEnvironment )
+import Distribution.Compat.CreatePipe
+import Distribution.Compat.Environment
 import qualified Distribution.PackageDescription as PD
-import Distribution.Simple.Build.PathsModule ( pkgPathEnvVar )
-import Distribution.Simple.BuildPaths ( exeExtension )
-import Distribution.Simple.Compiler ( compilerInfo )
-import Distribution.Simple.Hpc ( guessWay, markupTest, tixDir, tixFilePath )
+import Distribution.Simple.Build.PathsModule
+import Distribution.Simple.BuildPaths
+import Distribution.Simple.Compiler
+import Distribution.Simple.Hpc
 import Distribution.Simple.InstallDirs
-    ( fromPathTemplate, initialPathTemplateEnv, PathTemplateVariable(..)
-    , substPathTemplate , toPathTemplate, PathTemplate )
 import qualified Distribution.Simple.LocalBuildInfo as LBI
 import Distribution.Simple.Setup
-    ( TestFlags(..), TestShowDetails(..), fromFlag, configCoverage )
 import Distribution.Simple.Test.Log
 import Distribution.Simple.Utils
-    ( die, notice, rawSystemIOWithEnv, addLibraryPath )
-import Distribution.System ( Platform (..) )
+import Distribution.System
 import Distribution.TestSuite
 import Distribution.Text
-import Distribution.Verbosity ( normal )
+import Distribution.Verbosity
 
 import Control.Concurrent (forkIO)
 import Control.Monad ( unless, void, when )
@@ -30,7 +26,7 @@ import System.Directory
     , getCurrentDirectory, removeDirectoryRecursive )
 import System.Exit ( ExitCode(..) )
 import System.FilePath ( (</>), (<.>) )
-import System.IO ( hGetContents, hPutStr, stdout )
+import System.IO ( hGetContents, hPutStr, stdout, stderr )
 
 runTest :: PD.PackageDescription
         -> LBI.LocalBuildInfo
@@ -63,15 +59,20 @@ runTest pkg_descr lbi flags suite = do
     -- Write summary notices indicating start of test suite
     notice verbosity $ summarizeSuiteStart $ PD.testName suite
 
-    (rOut, wOut) <- createPipe
+    (wOut, wErr, logText) <- case details of
+        Direct -> return (stdout, stderr, "")
+        _ -> do
+            (rOut, wOut) <- createPipe
 
-    -- Read test executable's output lazily (returns immediately)
-    logText <- hGetContents rOut
-    -- Force the IO manager to drain the test output pipe
-    void $ forkIO $ length logText `seq` return ()
+            -- Read test executable's output lazily (returns immediately)
+            logText <- hGetContents rOut
+            -- Force the IO manager to drain the test output pipe
+            void $ forkIO $ length logText `seq` return ()
 
-    -- '--show-details=streaming': print the log output in another thread
-    when (details == Streaming) $ void $ forkIO $ hPutStr stdout logText
+            -- '--show-details=streaming': print the log output in another thread
+            when (details == Streaming) $ void $ forkIO $ hPutStr stdout logText
+
+            return (wOut, wOut, logText)
 
     -- Run the test executable
     let opts = map (testOption pkg_descr lbi suite)
@@ -93,7 +94,7 @@ runTest pkg_descr lbi flags suite = do
 
     exit <- rawSystemIOWithEnv verbosity cmd opts Nothing (Just shellEnv')
                                -- these handles are automatically closed
-                               Nothing (Just wOut) (Just wOut)
+                               Nothing (Just wOut) (Just wErr)
 
     -- Generate TestSuiteLog from executable exit code and a machine-
     -- readable test log.
@@ -112,12 +113,10 @@ runTest pkg_descr lbi flags suite = do
     -- Show the contents of the human-readable log file on the terminal
     -- if there is a failure and/or detailed output is requested
     let whenPrinting = when $
-            (details > Never)
-            && (not (suitePassed $ testLogs suiteLog) || details == Always)
+            ( details == Always ||
+              details == Failures && not (suitePassed $ testLogs suiteLog))
             -- verbosity overrides show-details
             && verbosity >= normal
-            -- if streaming, we already printed the log
-            && details /= Streaming
     whenPrinting $ putStr $ unlines $ lines logText
 
     -- Write summary notice to terminal indicating end of test suite
@@ -163,6 +162,6 @@ testOption pkg_descr lbi suite template =
     fromPathTemplate $ substPathTemplate env template
   where
     env = initialPathTemplateEnv
-          (PD.package pkg_descr) (LBI.localLibraryName lbi)
+          (PD.package pkg_descr) (LBI.localUnitId lbi)
           (compilerInfo $ LBI.compiler lbi) (LBI.hostPlatform lbi) ++
           [(TestSuiteNameVar, toPathTemplate $ PD.testName suite)]

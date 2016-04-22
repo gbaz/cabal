@@ -1,4 +1,5 @@
-{-# LANGUAGE CPP #-}
+{-# LANGUAGE DeriveGeneric #-}
+
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.Client.Sandbox.PackageEnvironment
@@ -61,10 +62,8 @@ import Distribution.Verbosity          ( Verbosity, normal )
 import Control.Monad                   ( foldM, liftM2, when, unless )
 import Data.List                       ( partition )
 import Data.Maybe                      ( isJust )
-#if !MIN_VERSION_base(4,8,0)
-import Data.Monoid                     ( Monoid(..) )
-#endif
 import Distribution.Compat.Exception   ( catchIO )
+import Distribution.Compat.Semigroup
 import System.Directory                ( doesDirectoryExist, doesFileExist
                                        , renameFile )
 import System.FilePath                 ( (<.>), (</>), takeDirectory )
@@ -75,6 +74,7 @@ import qualified Text.PrettyPrint          as Disp
 import qualified Distribution.Compat.ReadP as Parse
 import qualified Distribution.ParseUtils   as ParseUtils ( Field(..) )
 import qualified Distribution.Text         as Text
+import GHC.Generics ( Generic )
 
 
 --
@@ -88,20 +88,14 @@ data PackageEnvironment = PackageEnvironment {
   -- for constructing nested sandboxes (see discussion in #1196).
   pkgEnvInherit       :: Flag FilePath,
   pkgEnvSavedConfig   :: SavedConfig
-}
+} deriving Generic
 
 instance Monoid PackageEnvironment where
-  mempty = PackageEnvironment {
-    pkgEnvInherit       = mempty,
-    pkgEnvSavedConfig   = mempty
-    }
+  mempty = gmempty
+  mappend = (<>)
 
-  mappend a b = PackageEnvironment {
-    pkgEnvInherit       = combine pkgEnvInherit,
-    pkgEnvSavedConfig   = combine pkgEnvSavedConfig
-    }
-    where
-      combine f = f a `mappend` f b
+instance Semigroup PackageEnvironment where
+  (<>) = gmappend
 
 -- | The automatically-created package environment file that should not be
 -- touched by the user.
@@ -280,27 +274,30 @@ inheritedPackageEnvironment verbosity pkgEnv = do
       return $ mempty { pkgEnvSavedConfig = conf }
 
 -- | Load the user package environment if it exists (the optional "cabal.config"
--- file).
-userPackageEnvironment :: Verbosity -> FilePath -> IO PackageEnvironment
-userPackageEnvironment verbosity pkgEnvDir = do
-  let path = pkgEnvDir </> userPackageEnvironmentFile
-  minp <- readPackageEnvironmentFile ConstraintSourceUserConfig mempty path
-  case minp of
-    Nothing -> return mempty
-    Just (ParseOk warns parseResult) -> do
+-- file). If it does not exist locally, attempt to load an optional global one.
+userPackageEnvironment :: Verbosity -> FilePath -> Maybe FilePath -> IO PackageEnvironment
+userPackageEnvironment verbosity pkgEnvDir globalConfigLocation = do
+    let path = pkgEnvDir </> userPackageEnvironmentFile
+    minp <- readPackageEnvironmentFile (ConstraintSourceUserConfig path) mempty path
+    case (minp, globalConfigLocation) of
+      (Just parseRes, _)  -> processConfigParse path parseRes
+      (_, Just globalLoc) -> maybe (warn verbosity ("no constraints file found at " ++ globalLoc) >> return mempty) (processConfigParse globalLoc) =<< readPackageEnvironmentFile (ConstraintSourceUserConfig globalLoc) mempty globalLoc
+      _ -> return mempty
+  where
+    processConfigParse path (ParseOk warns parseResult) = do
       when (not $ null warns) $ warn verbosity $
         unlines (map (showPWarning path) warns)
       return parseResult
-    Just (ParseFailed err) -> do
+    processConfigParse path (ParseFailed err) = do
       let (line, msg) = locatedErrorMsg err
-      warn verbosity $ "Error parsing user package environment file " ++ path
+      warn verbosity $ "Error parsing package environment file " ++ path
         ++ maybe "" (\n -> ":" ++ show n) line ++ ":\n" ++ msg
       return mempty
 
 -- | Same as @userPackageEnvironmentFile@, but returns a SavedConfig.
-loadUserConfig :: Verbosity -> FilePath -> IO SavedConfig
-loadUserConfig verbosity pkgEnvDir = fmap pkgEnvSavedConfig
-                                     $ userPackageEnvironment verbosity pkgEnvDir
+loadUserConfig :: Verbosity -> FilePath -> Maybe FilePath -> IO SavedConfig
+loadUserConfig verbosity pkgEnvDir globalConfigLocation =
+    fmap pkgEnvSavedConfig $ userPackageEnvironment verbosity pkgEnvDir globalConfigLocation
 
 -- | Common error handling code used by 'tryLoadSandboxPackageEnvironment' and
 -- 'updatePackageEnvironment'.
@@ -347,7 +344,7 @@ tryLoadSandboxPackageEnvironmentFile verbosity pkgEnvFile configFileFlag = do
 
   let base   = basePackageEnvironment
   let common = commonPackageEnvironment sandboxDir
-  user      <- userPackageEnvironment verbosity pkgEnvDir
+  user      <- userPackageEnvironment verbosity pkgEnvDir Nothing --TODO
   inherited <- inheritedPackageEnvironment verbosity user
 
   -- Layer the package environment settings over settings from ~/.cabal/config.
@@ -400,7 +397,6 @@ pkgEnvFieldDescrs src = [
     (fromFlagOrDefault Disp.empty . fmap Disp.text) (optional parseFilePathQ)
     pkgEnvInherit (\v pkgEnv -> pkgEnv { pkgEnvInherit = v })
 
-    -- FIXME: Should we make these fields part of ~/.cabal/config ?
   , commaNewLineListField "constraints"
     (Text.disp . fst) ((\pc -> (pc, src)) `fmap` Text.parse)
     (configExConstraints . savedConfigureExFlags . pkgEnvSavedConfig)

@@ -22,12 +22,13 @@ module Language.Haskell.Extension (
         deprecatedExtensions
   ) where
 
-import Distribution.Text (Text(..))
+import Distribution.Text
 import qualified Distribution.Compat.ReadP as Parse
+import Distribution.Compat.Binary
+
 import qualified Text.PrettyPrint as Disp
 import qualified Data.Char as Char (isAlphaNum)
 import Data.Array (Array, accumArray, bounds, Ix(inRange), (!))
-import Distribution.Compat.Binary (Binary)
 import Data.Data (Data)
 import Data.Typeable (Typeable)
 import GHC.Generics (Generic)
@@ -718,6 +719,52 @@ data KnownExtension =
   --
   -- * <http://www.haskell.org/ghc/docs/latest/html/users_guide/deriving.html#deriving-lift>
   | DeriveLift
+
+  -- | Enable support for 'static pointers' (and the @static@
+  -- keyword) to refer to globally stable names, even across
+  -- different programs.
+  --
+  -- * <http://www.haskell.org/ghc/docs/latest/html/users_guide/static-pointers.html>
+  | StaticPointers
+
+  -- | Switches data type declarations to be strict by default (as if
+  -- they had a bang using @BangPatterns@), and allow opt-in field
+  -- laziness using @~@.
+  | StrictData
+
+  -- | Switches all pattern bindings to be strict by default (as if
+  -- they had a bang using @BangPatterns@), ordinary patterns are
+  -- recovered using @~@. Implies @StrictData@.
+  | Strict
+
+  -- | Allows @do@-notation for types that are @'Applicative'@ as well
+  -- as @'Monad'@. When enabled, desugaring @do@ notation tries to use
+  -- @(<*>)@ and @'fmap'@ and @'join'@ as far as possible.
+  | ApplicativeDo
+
+  -- | Allow records to use duplicated field labels for accessors.
+  | DuplicateRecordFields
+
+  -- | Enable explicit type applications with the syntax @id \@Int@.
+  | TypeApplications
+
+  -- | Dissolve the distinction between types and kinds, allowing the compiler
+  -- to reason about kind equality and therefore enabling GADTs to be promoted
+  -- to the type-level.
+  | TypeInType
+
+  -- | Allow recursive (and therefore undecideable) super-class relationships.
+  | UndecidableSuperClasses
+
+  -- | A temporary extension to help library authors check if their
+  -- code will compile with the new planned desugaring of fail.
+  | MonadFailDesugaring
+
+  -- | A subset of @TemplateHaskell@ including only quasi-quoting.
+  | TemplateHaskellQuotes
+
+  -- | Allows use of the @#label@ syntax.
+  | OverloadedLabels
 
   deriving (Generic, Show, Read, Eq, Ord, Enum, Bounded, Typeable, Data)
 

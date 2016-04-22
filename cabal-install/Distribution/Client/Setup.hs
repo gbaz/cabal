@@ -1,4 +1,7 @@
-{-# LANGUAGE CPP #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE DeriveGeneric #-}
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.Client.Setup
@@ -12,13 +15,15 @@
 --
 -----------------------------------------------------------------------------
 module Distribution.Client.Setup
-    ( globalCommand, GlobalFlags(..), defaultGlobalFlags, globalRepos
+    ( globalCommand, GlobalFlags(..), defaultGlobalFlags
+    , RepoContext(..), withRepoContext
     , configureCommand, ConfigFlags(..), filterConfigureFlags
     , configureExCommand, ConfigExFlags(..), defaultConfigExFlags
                         , configureExOptions
     , buildCommand, BuildFlags(..), BuildExFlags(..), SkipAddSourceDepsCheck(..)
     , replCommand, testCommand, benchmarkCommand
     , installCommand, InstallFlags(..), installOptions, defaultInstallFlags
+    , defaultSolver, defaultMaxBackjumps
     , listCommand, ListFlags(..)
     , updateCommand
     , upgradeCommand
@@ -26,6 +31,7 @@ module Distribution.Client.Setup
     , infoCommand, InfoFlags(..)
     , fetchCommand, FetchFlags(..)
     , freezeCommand, FreezeFlags(..)
+    , genBoundsCommand
     , getCommand, unpackCommand, GetFlags(..)
     , checkCommand
     , formatCommand
@@ -39,6 +45,7 @@ module Distribution.Client.Setup
     , sandboxCommand, defaultSandboxLocation, SandboxFlags(..)
     , execCommand, ExecFlags(..)
     , userConfigCommand, UserConfigFlags(..)
+    , manpageCommand
 
     , parsePackageArgs
     --TODO: stop exporting these:
@@ -48,17 +55,18 @@ module Distribution.Client.Setup
     ) where
 
 import Distribution.Client.Types
-         ( Username(..), Password(..), Repo(..), RemoteRepo(..), LocalRepo(..) )
+         ( Username(..), Password(..), RemoteRepo(..) )
 import Distribution.Client.BuildReports.Types
          ( ReportLevel(..) )
 import Distribution.Client.Dependency.Types
-         ( AllowNewer(..), PreSolver(..), ConstraintSource(..) )
+         ( PreSolver(..), ConstraintSource(..) )
 import qualified Distribution.Client.Init.Types as IT
          ( InitFlags(..), PackageType(..) )
 import Distribution.Client.Targets
          ( UserConstraint, readUserConstraint )
 import Distribution.Utils.NubList
          ( NubList, toNubList, fromNubList)
+
 
 import Distribution.Simple.Compiler (PackageDB)
 import Distribution.Simple.Program
@@ -71,8 +79,9 @@ import Distribution.Simple.Setup
          , TestFlags(..), BenchmarkFlags(..)
          , SDistFlags(..), HaddockFlags(..)
          , readPackageDbList, showPackageDbList
-         , Flag(..), toFlag, fromFlag, flagToMaybe, flagToList
-         , optionVerbosity, boolOpt, boolOpt', trueArg, falseArg, optionNumJobs )
+         , Flag(..), toFlag, flagToMaybe, flagToList
+         , optionVerbosity, boolOpt, boolOpt', trueArg, falseArg
+         , readPToMaybe, optionNumJobs )
 import Distribution.Simple.InstallDirs
          ( PathTemplate, InstallDirs(sysconfdir)
          , toPathTemplate, fromPathTemplate )
@@ -87,64 +96,31 @@ import Distribution.Text
 import Distribution.ReadE
          ( ReadE(..), readP_to_E, succeedReadE )
 import qualified Distribution.Compat.ReadP as Parse
-         ( ReadP, readP_to_S, readS_to_P, char, munch1, pfail, sepBy1, (+++) )
+         ( ReadP, char, munch1, pfail,  (+++) )
+import Distribution.Compat.Semigroup
 import Distribution.Verbosity
          ( Verbosity, normal )
 import Distribution.Simple.Utils
          ( wrapText, wrapLine )
+import Distribution.Client.GlobalFlags
+         ( GlobalFlags(..), defaultGlobalFlags
+         , RepoContext(..), withRepoContext
+         )
 
 import Data.Char
-         ( isSpace, isAlphaNum )
+         ( isAlphaNum )
 import Data.List
          ( intercalate, deleteFirstsBy )
 import Data.Maybe
-         ( listToMaybe, maybeToList, fromMaybe )
-#if !MIN_VERSION_base(4,8,0)
-import Data.Monoid
-         ( Monoid(..) )
-#endif
+         ( maybeToList, fromMaybe )
+import GHC.Generics (Generic)
+import Distribution.Compat.Binary (Binary)
 import Control.Monad
          ( liftM )
 import System.FilePath
          ( (</>) )
 import Network.URI
          ( parseAbsoluteURI, uriToString )
-
--- ------------------------------------------------------------
--- * Global flags
--- ------------------------------------------------------------
-
--- | Flags that apply at the top level, not to any sub-command.
-data GlobalFlags = GlobalFlags {
-    globalVersion           :: Flag Bool,
-    globalNumericVersion    :: Flag Bool,
-    globalConfigFile        :: Flag FilePath,
-    globalSandboxConfigFile :: Flag FilePath,
-    globalRemoteRepos       :: NubList RemoteRepo,     -- ^ Available Hackage servers.
-    globalCacheDir          :: Flag FilePath,
-    globalLocalRepos        :: NubList FilePath,
-    globalLogsDir           :: Flag FilePath,
-    globalWorldFile         :: Flag FilePath,
-    globalRequireSandbox    :: Flag Bool,
-    globalIgnoreSandbox     :: Flag Bool,
-    globalHttpTransport     :: Flag String
-  }
-
-defaultGlobalFlags :: GlobalFlags
-defaultGlobalFlags  = GlobalFlags {
-    globalVersion           = Flag False,
-    globalNumericVersion    = Flag False,
-    globalConfigFile        = mempty,
-    globalSandboxConfigFile = mempty,
-    globalRemoteRepos       = mempty,
-    globalCacheDir          = mempty,
-    globalLocalRepos        = mempty,
-    globalLogsDir           = mempty,
-    globalWorldFile         = mempty,
-    globalRequireSandbox    = Flag False,
-    globalIgnoreSandbox     = Flag False,
-    globalHttpTransport     = mempty
-  }
 
 globalCommand :: [Command action] -> CommandUI GlobalFlags
 globalCommand commands = CommandUI {
@@ -187,6 +163,7 @@ globalCommand commands = CommandUI {
           , "upload"
           , "report"
           , "freeze"
+          , "gen-bounds"
           , "haddock"
           , "hscolour"
           , "copy"
@@ -237,6 +214,7 @@ globalCommand commands = CommandUI {
         , addCmd "report"
         , par
         , addCmd "freeze"
+        , addCmd "gen-bounds"
         , addCmd "haddock"
         , addCmd "hscolour"
         , addCmd "copy"
@@ -261,9 +239,17 @@ globalCommand commands = CommandUI {
       ++ "  " ++ pname ++ " update\n",
     commandNotes = Nothing,
     commandDefaultFlags = mempty,
-    commandOptions      = \showOrParseArgs ->
-      (case showOrParseArgs of ShowArgs -> take 7; ParseArgs -> id)
-      [option ['V'] ["version"]
+    commandOptions = args
+  }
+  where
+    args :: ShowOrParseArgs -> [OptionField GlobalFlags]
+    args ShowArgs  = argsShown
+    args ParseArgs = argsShown ++ argsNotShown
+
+    -- arguments we want to show in the help
+    argsShown :: [OptionField GlobalFlags]
+    argsShown = [
+       option ['V'] ["version"]
          "Print version information"
          globalVersion (\v flags -> flags { globalVersion = v })
          trueArg
@@ -280,7 +266,12 @@ globalCommand commands = CommandUI {
 
       ,option [] ["sandbox-config-file"]
          "Set an alternate location for the sandbox config file (default: './cabal.sandbox.config')"
-         globalConfigFile (\v flags -> flags { globalSandboxConfigFile = v })
+         globalSandboxConfigFile (\v flags -> flags { globalSandboxConfigFile = v })
+         (reqArgFlag "FILE")
+
+      ,option [] ["default-user-config"]
+         "Set a location for a cabal.config file for projects without their own cabal.config freeze file."
+         globalConstraintsFile (\v flags -> flags {globalConstraintsFile = v})
          (reqArgFlag "FILE")
 
       ,option [] ["require-sandbox"]
@@ -293,12 +284,21 @@ globalCommand commands = CommandUI {
          globalIgnoreSandbox (\v flags -> flags { globalIgnoreSandbox = v })
          trueArg
 
+      ,option [] ["ignore-expiry"]
+         "Ignore expiry dates on signed metadata (use only in exceptional circumstances)"
+         globalIgnoreExpiry (\v flags -> flags { globalIgnoreExpiry = v })
+         trueArg
+
       ,option [] ["http-transport"]
          "Set a transport for http(s) requests. Accepts 'curl', 'wget', 'powershell', and 'plain-http'. (default: 'curl')"
-         globalConfigFile (\v flags -> flags { globalHttpTransport = v })
+         globalHttpTransport (\v flags -> flags { globalHttpTransport = v })
          (reqArgFlag "HttpTransport")
+      ]
 
-      ,option [] ["remote-repo"]
+    -- arguments we don't want shown in the help
+    argsNotShown :: [OptionField GlobalFlags]
+    argsNotShown = [
+       option [] ["remote-repo"]
          "The name and url for a remote repository"
          globalRemoteRepos (\v flags -> flags { globalRemoteRepos = v })
          (reqArg' "NAME:URL" (toNubList . maybeToList . readRepo) (map showRepo . fromNubList))
@@ -323,50 +323,6 @@ globalCommand commands = CommandUI {
          globalWorldFile (\v flags -> flags { globalWorldFile = v })
          (reqArgFlag "FILE")
       ]
-  }
-
-instance Monoid GlobalFlags where
-  mempty = GlobalFlags {
-    globalVersion           = mempty,
-    globalNumericVersion    = mempty,
-    globalConfigFile        = mempty,
-    globalSandboxConfigFile = mempty,
-    globalRemoteRepos       = mempty,
-    globalCacheDir          = mempty,
-    globalLocalRepos        = mempty,
-    globalLogsDir           = mempty,
-    globalWorldFile         = mempty,
-    globalRequireSandbox    = mempty,
-    globalIgnoreSandbox     = mempty,
-    globalHttpTransport     = mempty
-  }
-  mappend a b = GlobalFlags {
-    globalVersion           = combine globalVersion,
-    globalNumericVersion    = combine globalNumericVersion,
-    globalConfigFile        = combine globalConfigFile,
-    globalSandboxConfigFile = combine globalConfigFile,
-    globalRemoteRepos       = combine globalRemoteRepos,
-    globalCacheDir          = combine globalCacheDir,
-    globalLocalRepos        = combine globalLocalRepos,
-    globalLogsDir           = combine globalLogsDir,
-    globalWorldFile         = combine globalWorldFile,
-    globalRequireSandbox    = combine globalRequireSandbox,
-    globalIgnoreSandbox     = combine globalIgnoreSandbox,
-    globalHttpTransport     = combine globalHttpTransport
-  }
-    where combine field = field a `mappend` field b
-
-globalRepos :: GlobalFlags -> [Repo]
-globalRepos globalFlags = remoteRepos ++ localRepos
-  where
-    remoteRepos =
-      [ Repo (Left remote) cacheDir
-      | remote <- fromNubList $ globalRemoteRepos globalFlags
-      , let cacheDir = fromFlag (globalCacheDir globalFlags)
-                   </> remoteRepoName remote ]
-    localRepos =
-      [ Repo (Right LocalRepo) local
-      | local <- fromNubList $ globalLocalRepos globalFlags ]
 
 -- ------------------------------------------------------------
 -- * Config flags
@@ -397,6 +353,7 @@ filterConfigureFlags flags cabalLibVersion
   -- ^ NB: we expect the latest version to be the most common case.
   | cabalLibVersion <  Version [1,3,10] [] = flags_1_3_10
   | cabalLibVersion <  Version [1,10,0] [] = flags_1_10_0
+  | cabalLibVersion <  Version [1,12,0] [] = flags_1_12_0
   | cabalLibVersion <  Version [1,14,0] [] = flags_1_14_0
   | cabalLibVersion <  Version [1,18,0] [] = flags_1_18_0
   | cabalLibVersion <  Version [1,19,1] [] = flags_1_19_0
@@ -406,12 +363,18 @@ filterConfigureFlags flags cabalLibVersion
   | cabalLibVersion <  Version [1,23,0] [] = flags_1_22_0
   | otherwise = flags_latest
   where
-    -- Cabal >= 1.19.1 uses '--dependency' and does not need '--constraint'.
-    flags_latest = flags        { configConstraints = [] }
+    flags_latest = flags        {
+      -- Cabal >= 1.19.1 uses '--dependency' and does not need '--constraint'.
+      configConstraints = [],
+      -- Passing '--allow-newer' to Setup.hs is unnecessary, we use
+      -- '--exact-configuration' instead.
+      configAllowNewer  = Just Cabal.AllowNewerNone
+      }
 
     -- Cabal < 1.23 doesn't know about '--profiling-detail'.
     flags_1_22_0 = flags_latest { configProfDetail    = NoFlag
-                                , configProfLibDetail = NoFlag }
+                                , configProfLibDetail = NoFlag
+                                , configIPID          = NoFlag }
 
     -- Cabal < 1.22 doesn't know about '--disable-debug-info'.
     flags_1_21_0 = flags_1_22_0 { configDebugInfo = NoFlag }
@@ -440,8 +403,12 @@ filterConfigureFlags flags cabalLibVersion
     configInstallDirs_1_18_0 = (configInstallDirs flags) { sysconfdir = NoFlag }
     -- Cabal < 1.14.0 doesn't know about '--disable-benchmarks'.
     flags_1_14_0 = flags_1_18_0 { configBenchmarks  = NoFlag }
+    -- Cabal < 1.12.0 doesn't know about '--enable/disable-executable-dynamic'
+    -- and '--enable/disable-library-coverage'.
+    flags_1_12_0 = flags_1_14_0 { configLibCoverage = NoFlag
+                                , configDynExe      = NoFlag }
     -- Cabal < 1.10.0 doesn't know about '--disable-tests'.
-    flags_1_10_0 = flags_1_14_0 { configTests       = NoFlag }
+    flags_1_10_0 = flags_1_12_0 { configTests       = NoFlag }
     -- Cabal < 1.3.10 does not grok the '--constraints' flag.
     flags_1_3_10 = flags_1_10_0 { configConstraints = [] }
 
@@ -455,13 +422,12 @@ data ConfigExFlags = ConfigExFlags {
     configCabalVersion :: Flag Version,
     configExConstraints:: [(UserConstraint, ConstraintSource)],
     configPreferences  :: [Dependency],
-    configSolver       :: Flag PreSolver,
-    configAllowNewer   :: Flag AllowNewer
+    configSolver       :: Flag PreSolver
   }
+  deriving (Eq, Generic)
 
 defaultConfigExFlags :: ConfigExFlags
-defaultConfigExFlags = mempty { configSolver     = Flag defaultSolver
-                              , configAllowNewer = Flag AllowNewerNone }
+defaultConfigExFlags = mempty { configSolver     = Flag defaultSolver }
 
 configureExCommand :: CommandUI (ConfigFlags, ConfigExFlags)
 configureExCommand = configureCommand {
@@ -505,32 +471,14 @@ configureExOptions _showOrParseArgs src =
 
   , optionSolver configSolver (\v flags -> flags { configSolver = v })
 
-  , option [] ["allow-newer"]
-    ("Ignore upper bounds in all dependencies or " ++ allowNewerArgument)
-    configAllowNewer (\v flags -> flags { configAllowNewer = v})
-    (optArg allowNewerArgument
-     (fmap Flag allowNewerParser) (Flag AllowNewerAll)
-     allowNewerPrinter)
-
   ]
-  where allowNewerArgument = "DEPS"
 
 instance Monoid ConfigExFlags where
-  mempty = ConfigExFlags {
-    configCabalVersion = mempty,
-    configExConstraints= mempty,
-    configPreferences  = mempty,
-    configSolver       = mempty,
-    configAllowNewer   = mempty
-  }
-  mappend a b = ConfigExFlags {
-    configCabalVersion = combine configCabalVersion,
-    configExConstraints= combine configExConstraints,
-    configPreferences  = combine configPreferences,
-    configSolver       = combine configSolver,
-    configAllowNewer   = combine configAllowNewer
-  }
-    where combine field = field a `mappend` field b
+  mempty = gmempty
+  mappend = (<>)
+
+instance Semigroup ConfigExFlags where
+  (<>) = gmappend
 
 -- ------------------------------------------------------------
 -- * Build flags
@@ -542,7 +490,7 @@ data SkipAddSourceDepsCheck =
 
 data BuildExFlags = BuildExFlags {
   buildOnly     :: Flag SkipAddSourceDepsCheck
-}
+} deriving Generic
 
 buildExOptions :: ShowOrParseArgs -> [OptionField BuildExFlags]
 buildExOptions _showOrParseArgs =
@@ -569,13 +517,11 @@ buildCommand = parent {
     parent = Cabal.buildCommand defaultProgramConfiguration
 
 instance Monoid BuildExFlags where
-  mempty = BuildExFlags {
-    buildOnly    = mempty
-  }
-  mappend a b = BuildExFlags {
-    buildOnly    = combine buildOnly
-  }
-    where combine field = field a `mappend` field b
+  mempty = gmempty
+  mappend = (<>)
+
+instance Semigroup BuildExFlags where
+  (<>) = gmappend
 
 -- ------------------------------------------------------------
 -- * Repl command
@@ -799,6 +745,22 @@ freezeCommand = CommandUI {
 
   }
 
+genBoundsCommand :: CommandUI FreezeFlags
+genBoundsCommand = CommandUI {
+    commandName         = "gen-bounds",
+    commandSynopsis     = "Generate dependency bounds.",
+    commandDescription  = Just $ \_ -> wrapText $
+         "Generates bounds for all dependencies that do not currently have them. "
+      ++ "Generated bounds are printed to stdout.  You can then paste them into your .cabal file.\n"
+      ++ "\n",
+    commandNotes        = Nothing,
+    commandUsage        = usageFlags "gen-bounds",
+    commandDefaultFlags = defaultFreezeFlags,
+    commandOptions      = \ _ -> [
+     optionVerbosity freezeVerbosity (\v flags -> flags { freezeVerbosity = v })
+     ]
+  }
+
 -- ------------------------------------------------------------
 -- * Other commands
 -- ------------------------------------------------------------
@@ -877,6 +839,18 @@ uninstallCommand = CommandUI {
     commandOptions      = \_ -> []
   }
 
+manpageCommand :: CommandUI (Flag Verbosity)
+manpageCommand = CommandUI {
+    commandName         = "manpage",
+    commandSynopsis     = "Outputs manpage source.",
+    commandDescription  = Just $ \_ ->
+      "Output manpage source to STDOUT.\n",
+    commandNotes        = Nothing,
+    commandUsage        = usageFlags "manpage",
+    commandDefaultFlags = toFlag normal,
+    commandOptions      = \_ -> [optionVerbosity id const]
+  }
+
 runCommand :: CommandUI (BuildFlags, BuildExFlags)
 runCommand = CommandUI {
     commandName         = "run",
@@ -918,7 +892,7 @@ data ReportFlags = ReportFlags {
     reportUsername  :: Flag Username,
     reportPassword  :: Flag Password,
     reportVerbosity :: Flag Verbosity
-  }
+  } deriving Generic
 
 defaultReportFlags :: ReportFlags
 defaultReportFlags = ReportFlags {
@@ -954,17 +928,11 @@ reportCommand = CommandUI {
   }
 
 instance Monoid ReportFlags where
-  mempty = ReportFlags {
-    reportUsername  = mempty,
-    reportPassword  = mempty,
-    reportVerbosity = mempty
-  }
-  mappend a b = ReportFlags {
-    reportUsername  = combine reportUsername,
-    reportPassword  = combine reportPassword,
-    reportVerbosity = combine reportVerbosity
-  }
-    where combine field = field a `mappend` field b
+  mempty = gmempty
+  mappend = (<>)
+
+instance Semigroup ReportFlags where
+  (<>) = gmappend
 
 -- ------------------------------------------------------------
 -- * Get flags
@@ -975,7 +943,7 @@ data GetFlags = GetFlags {
     getPristine         :: Flag Bool,
     getSourceRepository :: Flag (Maybe RepoKind),
     getVerbosity        :: Flag Verbosity
-  }
+  } deriving Generic
 
 defaultGetFlags :: GetFlags
 defaultGetFlags = GetFlags {
@@ -1034,19 +1002,11 @@ unpackCommand = getCommand {
   }
 
 instance Monoid GetFlags where
-  mempty = GetFlags {
-    getDestDir          = mempty,
-    getPristine         = mempty,
-    getSourceRepository = mempty,
-    getVerbosity        = mempty
-    }
-  mappend a b = GetFlags {
-    getDestDir          = combine getDestDir,
-    getPristine         = combine getPristine,
-    getSourceRepository = combine getSourceRepository,
-    getVerbosity        = combine getVerbosity
-  }
-    where combine field = field a `mappend` field b
+  mempty = gmempty
+  mappend = (<>)
+
+instance Semigroup GetFlags where
+  (<>) = gmappend
 
 -- ------------------------------------------------------------
 -- * List flags
@@ -1057,7 +1017,7 @@ data ListFlags = ListFlags {
     listSimpleOutput :: Flag Bool,
     listVerbosity    :: Flag Verbosity,
     listPackageDBs   :: [Maybe PackageDB]
-  }
+  } deriving Generic
 
 defaultListFlags :: ListFlags
 defaultListFlags = ListFlags {
@@ -1113,19 +1073,11 @@ listCommand = CommandUI {
   }
 
 instance Monoid ListFlags where
-  mempty = ListFlags {
-    listInstalled    = mempty,
-    listSimpleOutput = mempty,
-    listVerbosity    = mempty,
-    listPackageDBs   = mempty
-    }
-  mappend a b = ListFlags {
-    listInstalled    = combine listInstalled,
-    listSimpleOutput = combine listSimpleOutput,
-    listVerbosity    = combine listVerbosity,
-    listPackageDBs   = combine listPackageDBs
-  }
-    where combine field = field a `mappend` field b
+  mempty = gmempty
+  mappend = (<>)
+
+instance Semigroup ListFlags where
+  (<>) = gmappend
 
 -- ------------------------------------------------------------
 -- * Info flags
@@ -1134,7 +1086,7 @@ instance Monoid ListFlags where
 data InfoFlags = InfoFlags {
     infoVerbosity  :: Flag Verbosity,
     infoPackageDBs :: [Maybe PackageDB]
-  }
+  } deriving Generic
 
 defaultInfoFlags :: InfoFlags
 defaultInfoFlags = InfoFlags {
@@ -1171,15 +1123,11 @@ infoCommand = CommandUI {
   }
 
 instance Monoid InfoFlags where
-  mempty = InfoFlags {
-    infoVerbosity  = mempty,
-    infoPackageDBs = mempty
-    }
-  mappend a b = InfoFlags {
-    infoVerbosity  = combine infoVerbosity,
-    infoPackageDBs = combine infoPackageDBs
-  }
-    where combine field = field a `mappend` field b
+  mempty = gmempty
+  mappend = (<>)
+
+instance Semigroup InfoFlags where
+  (<>) = gmappend
 
 -- ------------------------------------------------------------
 -- * Install flags
@@ -1213,6 +1161,9 @@ data InstallFlags = InstallFlags {
     installRunTests         :: Flag Bool,
     installOfflineMode      :: Flag Bool
   }
+  deriving (Eq, Generic)
+
+instance Binary InstallFlags
 
 defaultInstallFlags :: InstallFlags
 defaultInstallFlags = InstallFlags {
@@ -1244,27 +1195,6 @@ defaultInstallFlags = InstallFlags {
   where
     docIndexFile = toPathTemplate ("$datadir" </> "doc"
                                    </> "$arch-$os-$compiler" </> "index.html")
-
-allowNewerParser :: ReadE AllowNewer
-allowNewerParser = ReadE $ \s ->
-  case s of
-    ""      -> Right AllowNewerNone
-    "False" -> Right AllowNewerNone
-    "True"  -> Right AllowNewerAll
-    _       ->
-      case readPToMaybe pkgsParser s of
-        Just pkgs -> Right . AllowNewerSome $ pkgs
-        Nothing   -> Left ("Cannot parse the list of packages: " ++ s)
-  where
-    pkgsParser = Parse.sepBy1 parse (Parse.char ',')
-
-allowNewerPrinter :: Flag AllowNewer -> [Maybe String]
-allowNewerPrinter (Flag AllowNewerNone)        = [Just "False"]
-allowNewerPrinter (Flag AllowNewerAll)         = [Just "True"]
-allowNewerPrinter (Flag (AllowNewerSome pkgs)) =
-  [Just . intercalate "," . map display $ pkgs]
-allowNewerPrinter NoFlag                       = []
-
 
 defaultMaxBackjumps :: Int
 defaultMaxBackjumps = 2000
@@ -1482,59 +1412,11 @@ installOptions showOrParseArgs =
 
 
 instance Monoid InstallFlags where
-  mempty = InstallFlags {
-    installDocumentation   = mempty,
-    installHaddockIndex    = mempty,
-    installDryRun          = mempty,
-    installReinstall       = mempty,
-    installAvoidReinstalls = mempty,
-    installOverrideReinstall = mempty,
-    installMaxBackjumps    = mempty,
-    installUpgradeDeps     = mempty,
-    installReorderGoals    = mempty,
-    installIndependentGoals= mempty,
-    installShadowPkgs      = mempty,
-    installStrongFlags     = mempty,
-    installOnly            = mempty,
-    installOnlyDeps        = mempty,
-    installRootCmd         = mempty,
-    installSummaryFile     = mempty,
-    installLogFile         = mempty,
-    installBuildReports    = mempty,
-    installReportPlanningFailure = mempty,
-    installSymlinkBinDir   = mempty,
-    installOneShot         = mempty,
-    installNumJobs         = mempty,
-    installRunTests        = mempty,
-    installOfflineMode     = mempty
-  }
-  mappend a b = InstallFlags {
-    installDocumentation   = combine installDocumentation,
-    installHaddockIndex    = combine installHaddockIndex,
-    installDryRun          = combine installDryRun,
-    installReinstall       = combine installReinstall,
-    installAvoidReinstalls = combine installAvoidReinstalls,
-    installOverrideReinstall = combine installOverrideReinstall,
-    installMaxBackjumps    = combine installMaxBackjumps,
-    installUpgradeDeps     = combine installUpgradeDeps,
-    installReorderGoals    = combine installReorderGoals,
-    installIndependentGoals= combine installIndependentGoals,
-    installShadowPkgs      = combine installShadowPkgs,
-    installStrongFlags     = combine installStrongFlags,
-    installOnly            = combine installOnly,
-    installOnlyDeps        = combine installOnlyDeps,
-    installRootCmd         = combine installRootCmd,
-    installSummaryFile     = combine installSummaryFile,
-    installLogFile         = combine installLogFile,
-    installBuildReports    = combine installBuildReports,
-    installReportPlanningFailure = combine installReportPlanningFailure,
-    installSymlinkBinDir   = combine installSymlinkBinDir,
-    installOneShot         = combine installOneShot,
-    installNumJobs         = combine installNumJobs,
-    installRunTests        = combine installRunTests,
-    installOfflineMode     = combine installOfflineMode
-  }
-    where combine field = field a `mappend` field b
+  mempty = gmempty
+  mappend = (<>)
+
+instance Semigroup InstallFlags where
+  (<>) = gmappend
 
 -- ------------------------------------------------------------
 -- * Upload flags
@@ -1542,15 +1424,17 @@ instance Monoid InstallFlags where
 
 data UploadFlags = UploadFlags {
     uploadCheck       :: Flag Bool,
+    uploadDoc         :: Flag Bool,
     uploadUsername    :: Flag Username,
     uploadPassword    :: Flag Password,
     uploadPasswordCmd :: Flag [String],
     uploadVerbosity   :: Flag Verbosity
-  }
+  } deriving Generic
 
 defaultUploadFlags :: UploadFlags
 defaultUploadFlags = UploadFlags {
     uploadCheck       = toFlag False,
+    uploadDoc         = toFlag False,
     uploadUsername    = mempty,
     uploadPassword    = mempty,
     uploadPasswordCmd = mempty,
@@ -1560,7 +1444,7 @@ defaultUploadFlags = UploadFlags {
 uploadCommand :: CommandUI UploadFlags
 uploadCommand = CommandUI {
     commandName         = "upload",
-    commandSynopsis     = "Uploads source packages to Hackage.",
+    commandSynopsis     = "Uploads source packages or documentation to Hackage.",
     commandDescription  = Nothing,
     commandNotes        = Just $ \_ ->
          "You can store your Hackage login in the ~/.cabal/config file\n"
@@ -1574,6 +1458,11 @@ uploadCommand = CommandUI {
       ,option ['c'] ["check"]
          "Do not upload, just do QA checks."
         uploadCheck (\v flags -> flags { uploadCheck = v })
+        trueArg
+
+      ,option ['d'] ["documentation"]
+        "Upload documentation instead of a source package. Cannot be used together with --check."
+        uploadDoc (\v flags -> flags { uploadDoc = v })
         trueArg
 
       ,option ['u'] ["username"]
@@ -1596,21 +1485,11 @@ uploadCommand = CommandUI {
   }
 
 instance Monoid UploadFlags where
-  mempty = UploadFlags {
-    uploadCheck       = mempty,
-    uploadUsername    = mempty,
-    uploadPassword    = mempty,
-    uploadPasswordCmd = mempty,
-    uploadVerbosity   = mempty
-  }
-  mappend a b = UploadFlags {
-    uploadCheck       = combine uploadCheck,
-    uploadUsername    = combine uploadUsername,
-    uploadPassword    = combine uploadPassword,
-    uploadPasswordCmd = combine uploadPasswordCmd,
-    uploadVerbosity   = combine uploadVerbosity
-  }
-    where combine field = field a `mappend` field b
+  mempty = gmempty
+  mappend = (<>)
+
+instance Semigroup UploadFlags where
+  (<>) = gmappend
 
 -- ------------------------------------------------------------
 -- * Init flags
@@ -1807,7 +1686,7 @@ initCommand = CommandUI {
 data SDistExFlags = SDistExFlags {
     sDistFormat    :: Flag ArchiveFormat
   }
-  deriving Show
+  deriving (Show, Generic)
 
 data ArchiveFormat = TargzFormat | ZipFormat -- | ...
   deriving (Show, Eq)
@@ -1840,14 +1719,11 @@ sdistCommand = Cabal.sdistCommand {
       ]
 
 instance Monoid SDistExFlags where
-  mempty = SDistExFlags {
-    sDistFormat  = mempty
-  }
-  mappend a b = SDistExFlags {
-    sDistFormat  = combine sDistFormat
-  }
-    where
-      combine field = field a `mappend` field b
+  mempty = gmempty
+  mappend = (<>)
+
+instance Semigroup SDistExFlags where
+  (<>) = gmappend
 
 -- ------------------------------------------------------------
 -- * Win32SelfUpgrade flags
@@ -1855,7 +1731,7 @@ instance Monoid SDistExFlags where
 
 data Win32SelfUpgradeFlags = Win32SelfUpgradeFlags {
   win32SelfUpgradeVerbosity :: Flag Verbosity
-}
+} deriving Generic
 
 defaultWin32SelfUpgradeFlags :: Win32SelfUpgradeFlags
 defaultWin32SelfUpgradeFlags = Win32SelfUpgradeFlags {
@@ -1878,13 +1754,11 @@ win32SelfUpgradeCommand = CommandUI {
 }
 
 instance Monoid Win32SelfUpgradeFlags where
-  mempty      = Win32SelfUpgradeFlags {
-    win32SelfUpgradeVerbosity = mempty
-    }
-  mappend a b = Win32SelfUpgradeFlags {
-    win32SelfUpgradeVerbosity = combine win32SelfUpgradeVerbosity
-    }
-    where combine field = field a `mappend` field b
+  mempty = gmempty
+  mappend = (<>)
+
+instance Semigroup Win32SelfUpgradeFlags where
+  (<>) = gmappend
 
 -- ------------------------------------------------------------
 -- * ActAsSetup flags
@@ -1892,7 +1766,7 @@ instance Monoid Win32SelfUpgradeFlags where
 
 data ActAsSetupFlags = ActAsSetupFlags {
     actAsSetupBuildType :: Flag BuildType
-}
+} deriving Generic
 
 defaultActAsSetupFlags :: ActAsSetupFlags
 defaultActAsSetupFlags = ActAsSetupFlags {
@@ -1919,13 +1793,11 @@ actAsSetupCommand = CommandUI {
 }
 
 instance Monoid ActAsSetupFlags where
-  mempty      = ActAsSetupFlags {
-     actAsSetupBuildType = mempty
-    }
-  mappend a b = ActAsSetupFlags {
-    actAsSetupBuildType = combine actAsSetupBuildType
-    }
-    where combine field = field a `mappend` field b
+  mempty = gmempty
+  mappend = (<>)
+
+instance Semigroup ActAsSetupFlags where
+  (<>) = gmappend
 
 -- ------------------------------------------------------------
 -- * Sandbox-related flags
@@ -1936,7 +1808,7 @@ data SandboxFlags = SandboxFlags {
   sandboxSnapshot  :: Flag Bool, -- FIXME: this should be an 'add-source'-only
                                  -- flag.
   sandboxLocation  :: Flag FilePath
-}
+} deriving Generic
 
 defaultSandboxLocation :: FilePath
 defaultSandboxLocation = ".cabal-sandbox"
@@ -2043,17 +1915,11 @@ sandboxCommand = CommandUI {
   }
 
 instance Monoid SandboxFlags where
-  mempty = SandboxFlags {
-    sandboxVerbosity = mempty,
-    sandboxSnapshot  = mempty,
-    sandboxLocation  = mempty
-    }
-  mappend a b = SandboxFlags {
-    sandboxVerbosity = combine sandboxVerbosity,
-    sandboxSnapshot  = combine sandboxSnapshot,
-    sandboxLocation  = combine sandboxLocation
-    }
-    where combine field = field a `mappend` field b
+  mempty = gmempty
+  mappend = (<>)
+
+instance Semigroup SandboxFlags where
+  (<>) = gmappend
 
 -- ------------------------------------------------------------
 -- * Exec Flags
@@ -2061,7 +1927,7 @@ instance Monoid SandboxFlags where
 
 data ExecFlags = ExecFlags {
   execVerbosity :: Flag Verbosity
-}
+} deriving Generic
 
 defaultExecFlags :: ExecFlags
 defaultExecFlags = ExecFlags {
@@ -2113,30 +1979,30 @@ execCommand = CommandUI {
   }
 
 instance Monoid ExecFlags where
-  mempty = ExecFlags {
-    execVerbosity = mempty
-    }
-  mappend a b = ExecFlags {
-    execVerbosity = combine execVerbosity
-    }
-    where combine field = field a `mappend` field b
+  mempty = gmempty
+  mappend = (<>)
+
+instance Semigroup ExecFlags where
+  (<>) = gmappend
 
 -- ------------------------------------------------------------
 -- * UserConfig flags
 -- ------------------------------------------------------------
 
 data UserConfigFlags = UserConfigFlags {
-  userConfigVerbosity :: Flag Verbosity
-}
+  userConfigVerbosity :: Flag Verbosity,
+  userConfigForce     :: Flag Bool
+} deriving Generic
 
 instance Monoid UserConfigFlags where
   mempty = UserConfigFlags {
-    userConfigVerbosity = toFlag normal
+    userConfigVerbosity = toFlag normal,
+    userConfigForce     = toFlag False
     }
-  mappend a b = UserConfigFlags {
-    userConfigVerbosity = combine userConfigVerbosity
-    }
-    where combine field = field a `mappend` field b
+  mappend = (<>)
+
+instance Semigroup UserConfigFlags where
+  (<>) = gmappend
 
 userConfigCommand :: CommandUI UserConfigFlags
 userConfigCommand = CommandUI {
@@ -2149,6 +2015,9 @@ userConfigCommand = CommandUI {
     ++ " (i.e. all bindings that are actually defined and not commented out)"
     ++ " and the default config of the new version.\n"
     ++ "\n"
+    ++ "init: Creates a new config file at either ~/.cabal/config or as"
+    ++ " specified by --config-file, if given. An existing file won't be "
+    ++ " overwritten unless -f or --force is given.\n"
     ++ "diff: Shows a pseudo-diff of the user's ~/.cabal/config file and"
     ++ " the default configuration that would be created by cabal if the"
     ++ " config file did not exist.\n"
@@ -2156,10 +2025,14 @@ userConfigCommand = CommandUI {
     ++ " created by default, and write the result back to ~/.cabal/config.",
 
   commandNotes        = Nothing,
-  commandUsage        = usageAlternatives "user-config" ["diff", "update"],
+  commandUsage        = usageAlternatives "user-config" ["init", "diff", "update"],
   commandDefaultFlags = mempty,
   commandOptions      = \ _ -> [
    optionVerbosity userConfigVerbosity (\v flags -> flags { userConfigVerbosity = v })
+ , option ['f'] ["force"]
+     "Overwrite the config file if it already exists."
+     userConfigForce (\v flags -> flags { userConfigForce = v })
+     trueArg
    ]
   }
 
@@ -2201,8 +2074,7 @@ optionSolverFlags showOrParseArgs getmbj setmbj getrg setrg _getig _setig getsip
   [ option [] ["max-backjumps"]
       ("Maximum number of backjumps allowed while solving (default: " ++ show defaultMaxBackjumps ++ "). Use a negative number to enable unlimited backtracking. Use 0 to disable backtracking completely.")
       getmbj setmbj
-      (reqArg "NUM" (readP_to_E ("Cannot parse number: "++)
-                                (fmap toFlag (Parse.readS_to_P reads)))
+      (reqArg "NUM" (readP_to_E ("Cannot parse number: "++) (fmap toFlag parse))
                     (map show . flagToList))
   , option [] ["reorder-goals"]
       "Try to reorder goals according to certain heuristics. Slows things down on average, but may make backtracking faster for some packages."
@@ -2250,10 +2122,6 @@ parsePackageArgs = parsePkgArgs []
          show arg ++ " is not valid syntax for a package name or"
                   ++ " package dependency."
 
-readPToMaybe :: Parse.ReadP a a -> String -> Maybe a
-readPToMaybe p str = listToMaybe [ r | (r,s) <- Parse.readP_to_S p str
-                                     , all isSpace s ]
-
 parseDependencyOrPackageId :: Parse.ReadP r Dependency
 parseDependencyOrPackageId = parse Parse.+++ liftM pkgidToDependency parse
   where
@@ -2278,7 +2146,9 @@ parseRepo = do
   return RemoteRepo {
     remoteRepoName           = name,
     remoteRepoURI            = uri,
-    remoteRepoRootKeys       = (),
+    remoteRepoSecure         = Nothing,
+    remoteRepoRootKeys       = [],
+    remoteRepoKeyThreshold   = 0,
     remoteRepoShouldTryHttps = False
   }
 
@@ -2301,6 +2171,7 @@ paragraph = (++"\n")
 
 indentParagraph :: String -> String
 indentParagraph = unlines
+                . (flip (++)) [""]
                 . map (("  "++).unwords)
                 . wrapLine 77
                 . words

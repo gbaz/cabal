@@ -13,6 +13,7 @@
 --
 module Distribution.Text (
   Text(..),
+  defaultStyle,
   display,
   simpleParse,
   ) where
@@ -27,13 +28,15 @@ class Text a where
   disp  :: a -> Disp.Doc
   parse :: Parse.ReadP r a
 
+-- | The default rendering style used in Cabal for console output.
+defaultStyle :: Disp.Style
+defaultStyle = Disp.Style { Disp.mode           = Disp.PageMode
+                          , Disp.lineLength     = 79
+                          , Disp.ribbonsPerLine = 1.0
+                          }
+
 display :: Text a => a -> String
-display = Disp.renderStyle style . disp
-  where style = Disp.Style {
-          Disp.mode            = Disp.PageMode,
-          Disp.lineLength      = 79,
-          Disp.ribbonsPerLine  = 1.0
-        }
+display = Disp.renderStyle defaultStyle . disp
 
 simpleParse :: Text a => String -> Maybe a
 simpleParse str = case [ p | (p, s) <- Parse.readP_to_S parse str
@@ -51,19 +54,20 @@ instance Text Bool where
                        , (Parse.string "False" Parse.+++
                           Parse.string "false") >> return False ]
 
+instance Text Int where
+  disp  = Disp.text . show
+  parse = (fmap negate $ Parse.char '-' >> parseNat) Parse.+++ parseNat
+
+-- | Parser for non-negative integers.
+parseNat :: Parse.ReadP r Int
+parseNat = read `fmap` Parse.munch1 Char.isDigit
+
 instance Text Version where
   disp (Version branch _tags)     -- Death to version tags!!
     = Disp.hcat (Disp.punctuate (Disp.char '.') (map Disp.int branch))
 
   parse = do
-      branch <- Parse.sepBy1 digits (Parse.char '.')
+      branch <- Parse.sepBy1 parseNat (Parse.char '.')
                 -- allow but ignore tags:
       _tags  <- Parse.many (Parse.char '-' >> Parse.munch1 Char.isAlphaNum)
       return (Version branch [])
-    where
-      digits = do
-        first <- Parse.satisfy Char.isDigit
-        if first == '0'
-          then return 0
-          else do rest <- Parse.munch Char.isDigit
-                  return (read (first : rest))

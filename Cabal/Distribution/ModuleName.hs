@@ -22,14 +22,14 @@ module Distribution.ModuleName (
   ) where
 
 import Distribution.Text
-         ( Text(..) )
+import Distribution.Compat.Binary
+import qualified Distribution.Compat.ReadP as Parse
 
-import Distribution.Compat.Binary (Binary)
 import qualified Data.Char as Char
          ( isAlphaNum, isUpper )
+import Control.DeepSeq
 import Data.Data (Data)
 import Data.Typeable (Typeable)
-import qualified Distribution.Compat.ReadP as Parse
 import qualified Text.PrettyPrint as Disp
 import Data.List
          ( intercalate, intersperse )
@@ -43,6 +43,9 @@ newtype ModuleName = ModuleName [String]
   deriving (Eq, Generic, Ord, Read, Show, Typeable, Data)
 
 instance Binary ModuleName
+
+instance NFData ModuleName where
+    rnf (ModuleName ms) = rnf ms
 
 instance Text ModuleName where
   disp (ModuleName ms) =

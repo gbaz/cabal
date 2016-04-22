@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP #-}
+{-# LANGUAGE DeriveGeneric #-}
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.Client.BuildTargets
@@ -14,10 +14,14 @@ module Distribution.Simple.BuildTarget (
     -- * Build targets
     BuildTarget(..),
     readBuildTargets,
+    showBuildTarget,
+    QualLevel(..),
+    buildTargetComponentName,
 
     -- * Parsing user build targets
     UserBuildTarget,
     readUserBuildTargets,
+    showUserBuildTarget,
     UserBuildTargetProblem(..),
     reportUserBuildTargetProblems,
 
@@ -25,44 +29,33 @@ module Distribution.Simple.BuildTarget (
     resolveBuildTargets,
     BuildTargetProblem(..),
     reportBuildTargetProblems,
+
+    -- * Checking build targets
+    checkBuildTargets
   ) where
 
-import Distribution.Package
-         ( Package(..), PackageId, packageName )
-
 import Distribution.PackageDescription
-         ( PackageDescription
-         , Executable(..)
-         , TestSuite(..), TestSuiteInterface(..), testModules
-         , Benchmark(..), BenchmarkInterface(..), benchmarkModules
-         , BuildInfo(..), libModules, exeModules )
 import Distribution.ModuleName
-         ( ModuleName, toFilePath )
 import Distribution.Simple.LocalBuildInfo
-         ( Component(..), ComponentName(..)
-         , pkgComponents, componentName, componentBuildInfo )
-
 import Distribution.Text
-         ( display )
 import Distribution.Simple.Utils
-         ( die, lowercase, equating )
+import Distribution.Verbosity
+
+import Distribution.Compat.Binary (Binary)
+import qualified Distribution.Compat.ReadP as Parse
+import Distribution.Compat.ReadP
+         ( (+++), (<++) )
 
 import Data.List
-         ( nub, stripPrefix, sortBy, groupBy, partition, intercalate )
-import Data.Ord
+         ( nub, stripPrefix, sortBy, groupBy, partition )
 import Data.Maybe
          ( listToMaybe, catMaybes )
 import Data.Either
          ( partitionEithers )
+import GHC.Generics (Generic)
 import qualified Data.Map as Map
 import Control.Monad
-#if __GLASGOW_HASKELL__ < 710
-import Control.Applicative (Applicative(..))
-#endif
-import Control.Applicative (Alternative(..))
-import qualified Distribution.Compat.ReadP as Parse
-import Distribution.Compat.ReadP
-         ( (+++), (<++) )
+import Control.Applicative as AP (Alternative(..), Applicative(..))
 import Data.Char
          ( isSpace, isAlphaNum )
 import System.FilePath as FilePath
@@ -127,13 +120,19 @@ data BuildTarget =
      -- | A specific file within a specific component.
      --
    | BuildTargetFile ComponentName FilePath
-  deriving (Show,Eq)
+  deriving (Eq, Show, Generic)
 
+instance Binary BuildTarget
 
--- ------------------------------------------------------------
--- * Do everything
--- ------------------------------------------------------------
+buildTargetComponentName :: BuildTarget -> ComponentName
+buildTargetComponentName (BuildTargetComponent cn)   = cn
+buildTargetComponentName (BuildTargetModule    cn _) = cn
+buildTargetComponentName (BuildTargetFile      cn _) = cn
 
+-- | Read a list of user-supplied build target strings and resolve them to
+-- 'BuildTarget's according to a 'PackageDescription'. If there are problems
+-- with any of the targets e.g. they don't exist or are misformatted, throw an
+-- 'IOException'.
 readBuildTargets :: PackageDescription -> [String] -> IO [BuildTarget]
 readBuildTargets pkg targetStrs = do
     let (uproblems, utargets) = readUserBuildTargets targetStrs
@@ -226,11 +225,15 @@ reportUserBuildTargetProblems problems = do
            ++ " - build foo:Data/Foo.hsc  -- file qualified by component"
 
 showUserBuildTarget :: UserBuildTarget -> String
-showUserBuildTarget = intercalate ":" . components
+showUserBuildTarget = intercalate ":" . getComponents
   where
-    components (UserBuildTargetSingle s1)       = [s1]
-    components (UserBuildTargetDouble s1 s2)    = [s1,s2]
-    components (UserBuildTargetTriple s1 s2 s3) = [s1,s2,s3]
+    getComponents (UserBuildTargetSingle s1)       = [s1]
+    getComponents (UserBuildTargetDouble s1 s2)    = [s1,s2]
+    getComponents (UserBuildTargetTriple s1 s2 s3) = [s1,s2,s3]
+
+showBuildTarget :: QualLevel -> BuildTarget -> String
+showBuildTarget ql bt =
+    showUserBuildTarget (renderBuildTarget ql bt)
 
 
 -- ------------------------------------------------------------
@@ -267,7 +270,7 @@ resolveBuildTarget pkg userTarget fexists =
       Unambiguous target  -> Right target
       Ambiguous   targets -> Left (BuildTargetAmbiguous userTarget targets')
                                where targets' = disambiguateBuildTargets
-                                                    (packageId pkg) userTarget
+                                                    userTarget
                                                     targets
       None        errs    -> Left (classifyMatchErrors errs)
 
@@ -291,9 +294,9 @@ data BuildTargetProblem
   deriving Show
 
 
-disambiguateBuildTargets :: PackageId -> UserBuildTarget -> [BuildTarget]
+disambiguateBuildTargets :: UserBuildTarget -> [BuildTarget]
                          -> [(UserBuildTarget, BuildTarget)]
-disambiguateBuildTargets pkgid original =
+disambiguateBuildTargets original =
     disambiguate (userTargetQualLevel original)
   where
     disambiguate ql ts
@@ -312,13 +315,13 @@ disambiguateBuildTargets pkgid original =
             . partition (\g -> length g > 1)
             . groupBy (equating fst)
             . sortBy (comparing fst)
-            . map (\t -> (renderBuildTarget ql t pkgid, t))
+            . map (\t -> (renderBuildTarget ql t, t))
 
 data QualLevel = QL1 | QL2 | QL3
   deriving (Enum, Show)
 
-renderBuildTarget :: QualLevel -> BuildTarget -> PackageId -> UserBuildTarget
-renderBuildTarget ql target pkgid =
+renderBuildTarget :: QualLevel -> BuildTarget -> UserBuildTarget
+renderBuildTarget ql target =
     case ql of
       QL1 -> UserBuildTargetSingle s1        where  s1          = single target
       QL2 -> UserBuildTargetDouble s1 s2     where (s1, s2)     = double target
@@ -337,7 +340,7 @@ renderBuildTarget ql target pkgid =
     triple (BuildTargetModule    cn m) = (dispKind cn, dispCName cn, display m)
     triple (BuildTargetFile      cn f) = (dispKind cn, dispCName cn, f)
 
-    dispCName = componentStringName pkgid
+    dispCName = componentStringName
     dispKind  = showComponentKindShort . componentKind
 
 reportBuildTargetProblems :: [BuildTargetProblem] -> IO ()
@@ -440,7 +443,7 @@ pkgComponentInfo :: PackageDescription -> [ComponentInfo]
 pkgComponentInfo pkg =
     [ ComponentInfo {
         cinfoName    = componentName c,
-        cinfoStrName = componentStringName pkg (componentName c),
+        cinfoStrName = componentStringName (componentName c),
         cinfoSrcDirs = hsSourceDirs bi,
         cinfoModules = componentModules c,
         cinfoHsFiles = componentHsFiles c,
@@ -450,11 +453,11 @@ pkgComponentInfo pkg =
     | c <- pkgComponents pkg
     , let bi = componentBuildInfo c ]
 
-componentStringName :: Package pkg => pkg -> ComponentName -> ComponentStringName
-componentStringName pkg CLibName          = display (packageName pkg)
-componentStringName _   (CExeName  name)  = name
-componentStringName _   (CTestName  name) = name
-componentStringName _   (CBenchName name) = name
+componentStringName :: ComponentName -> ComponentStringName
+componentStringName (CLibName   name) = name
+componentStringName (CExeName   name) = name
+componentStringName (CTestName  name) = name
+componentStringName (CBenchName name) = name
 
 componentModules :: Component -> [ModuleName]
 componentModules (CLib   lib)   = libModules lib
@@ -494,8 +497,8 @@ data ComponentKind = LibKind | ExeKind | TestKind | BenchKind
   deriving (Eq, Ord, Show)
 
 componentKind :: ComponentName -> ComponentKind
-componentKind CLibName       = LibKind
-componentKind (CExeName  _)  = ExeKind
+componentKind (CLibName   _) = LibKind
+componentKind (CExeName   _) = ExeKind
 componentKind (CTestName  _) = TestKind
 componentKind (CBenchName _) = BenchKind
 
@@ -798,11 +801,12 @@ instance Functor Match where
   fmap f (InexactMatch d xs) = InexactMatch d (fmap f xs)
 
 instance Applicative Match where
-  pure = return
+  pure a = ExactMatch 0 [a]
   (<*>) = ap
 
 instance Monad Match where
-  return a                = ExactMatch 0 [a]
+  return = AP.pure
+
   NoMatch      d ms >>= _ = NoMatch d ms
   ExactMatch   d xs >>= f = addDepth d
                           $ foldr matchPlus matchZero (map f xs)
@@ -937,3 +941,49 @@ matchInexactly cannonicalise xs =
 
 caseFold :: String -> String
 caseFold = lowercase
+
+
+-- | Check that the given build targets are valid in the current context.
+--
+-- Also swizzle into a more convenient form.
+--
+checkBuildTargets :: Verbosity -> PackageDescription -> [BuildTarget]
+                  -> IO [(ComponentName, Maybe (Either ModuleName FilePath))]
+checkBuildTargets _ pkg []      =
+    return [ (componentName c, Nothing) | c <- pkgEnabledComponents pkg ]
+
+checkBuildTargets verbosity pkg targets = do
+
+    let (enabled, disabled) =
+          partitionEithers
+            [ case componentDisabledReason (getComponent pkg cname) of
+                Nothing     -> Left  target'
+                Just reason -> Right (cname, reason)
+            | target <- targets
+            , let target'@(cname,_) = swizzleTarget target ]
+
+    case disabled of
+      []                 -> return ()
+      ((cname,reason):_) -> die $ formatReason (showComponentName cname) reason
+
+    forM_ [ (c, t) | (c, Just t) <- enabled ] $ \(c, t) ->
+      warn verbosity $ "Ignoring '" ++ either display id t ++ ". The whole "
+                    ++ showComponentName c ++ " will be processed. (Support for "
+                    ++ "module and file targets has not been implemented yet.)"
+
+    return enabled
+
+  where
+    swizzleTarget (BuildTargetComponent c)   = (c, Nothing)
+    swizzleTarget (BuildTargetModule    c m) = (c, Just (Left  m))
+    swizzleTarget (BuildTargetFile      c f) = (c, Just (Right f))
+
+    formatReason cn DisabledComponent =
+        "Cannot process the " ++ cn ++ " because the component is marked "
+     ++ "as disabled in the .cabal file."
+    formatReason cn DisabledAllTests =
+        "Cannot process the " ++ cn ++ " because test suites are not "
+     ++ "enabled. Run configure with the flag --enable-tests"
+    formatReason cn DisabledAllBenchmarks =
+        "Cannot process the " ++ cn ++ " because benchmarks are not "
+     ++ "enabled. Re-run configure with the flag --enable-benchmarks"

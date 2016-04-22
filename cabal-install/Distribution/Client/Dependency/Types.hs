@@ -1,5 +1,6 @@
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE DeriveFunctor #-}
+{-# LANGUAGE DeriveGeneric #-}
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.Client.Dependency.Types
@@ -18,7 +19,6 @@ module Distribution.Client.Dependency.Types (
     DependencyResolver,
     ResolverPackage(..),
 
-    AllowNewer(..), isAllowNewer,
     PackageConstraint(..),
     showPackageConstraint,
     PackagePreferences(..),
@@ -32,6 +32,7 @@ module Distribution.Client.Dependency.Types (
     ConstraintSource(..),
     unlabelPackageConstraint,
     showConstraintSource
+
   ) where
 
 #if !MIN_VERSION_base(4,8,0)
@@ -48,8 +49,10 @@ import Data.Monoid
          ( Monoid(..) )
 #endif
 
+import Distribution.Client.PkgConfigDb
+         ( PkgConfigDb )
 import Distribution.Client.Types
-         ( OptionalStanza(..), SourcePackage(..), ConfiguredPackage )
+         ( OptionalStanza(..), SourcePackage(..), SolverPackage )
 
 import qualified Distribution.Compat.ReadP as Parse
          ( pfail, munch1 )
@@ -73,17 +76,22 @@ import Distribution.Text
 
 import Text.PrettyPrint
          ( text )
+import GHC.Generics (Generic)
+import Distribution.Compat.Binary (Binary(..))
 
 import Prelude hiding (fail)
 
 
 -- | All the solvers that can be selected.
 data PreSolver = AlwaysTopDown | AlwaysModular | Choose
-  deriving (Eq, Ord, Show, Bounded, Enum)
+  deriving (Eq, Ord, Show, Bounded, Enum, Generic)
 
 -- | All the solvers that can be used.
 data Solver = TopDown | Modular
-  deriving (Eq, Ord, Show, Bounded, Enum)
+  deriving (Eq, Ord, Show, Bounded, Enum, Generic)
+
+instance Binary PreSolver
+instance Binary Solver
 
 instance Text PreSolver where
   disp AlwaysTopDown = text "topdown"
@@ -105,22 +113,23 @@ instance Text PreSolver where
 -- solving the package dependency problem and we want to make it easy to swap
 -- in alternatives.
 --
-type DependencyResolver = Platform
-                       -> CompilerInfo
-                       -> InstalledPackageIndex
-                       ->          PackageIndex.PackageIndex SourcePackage
-                       -> (PackageName -> PackagePreferences)
-                       -> [LabeledPackageConstraint]
-                       -> [PackageName]
-                       -> Progress String String [ResolverPackage]
+type DependencyResolver loc = Platform
+                           -> CompilerInfo
+                           -> InstalledPackageIndex
+                           -> PackageIndex.PackageIndex (SourcePackage loc)
+                           -> PkgConfigDb
+                           -> (PackageName -> PackagePreferences)
+                           -> [LabeledPackageConstraint]
+                           -> [PackageName]
+                           -> Progress String String [ResolverPackage loc]
 
 -- | The dependency resolver picks either pre-existing installed packages
 -- or it picks source packages along with package configuration.
 --
 -- This is like the 'InstallPlan.PlanPackage' but with fewer cases.
 --
-data ResolverPackage = PreExisting InstalledPackageInfo
-                     | Configured  ConfiguredPackage
+data ResolverPackage loc = PreExisting InstalledPackageInfo
+                         | Configured  (SolverPackage loc)
 
 -- | Per-package constraints. Package constraints must be respected by the
 -- solver. Multiple constraints for each package can be given, though obviously
@@ -133,7 +142,9 @@ data PackageConstraint
    | PackageConstraintSource    PackageName
    | PackageConstraintFlags     PackageName FlagAssignment
    | PackageConstraintStanzas   PackageName [OptionalStanza]
-  deriving (Show,Eq)
+  deriving (Eq,Show,Generic)
+
+instance Binary PackageConstraint
 
 -- | Provide a textual representation of a package constraint
 -- for debugging purposes.
@@ -156,17 +167,20 @@ showPackageConstraint (PackageConstraintStanzas pn ss) =
     showStanza TestStanzas  = "test"
     showStanza BenchStanzas = "bench"
 
--- | A per-package preference on the version. It is a soft constraint that the
+-- | Per-package preferences on the version. It is a soft constraint that the
 -- 'DependencyResolver' should try to respect where possible. It consists of
--- a 'InstalledPreference' which says if we prefer versions of packages
--- that are already installed. It also has a 'PackageVersionPreference' which
--- is a suggested constraint on the version number. The resolver should try to
--- use package versions that satisfy the suggested version constraint.
+-- an 'InstalledPreference' which says if we prefer versions of packages
+-- that are already installed. It also has (possibly multiple)
+-- 'PackageVersionPreference's which are suggested constraints on the version
+-- number. The resolver should try to use package versions that satisfy
+-- the maximum number of the suggested version constraints.
 --
 -- It is not specified if preferences on some packages are more important than
 -- others.
 --
-data PackagePreferences = PackagePreferences VersionRange InstalledPreference
+data PackagePreferences = PackagePreferences [VersionRange]
+                                             InstalledPreference
+                                             [OptionalStanza]
 
 -- | Whether we prefer an installed version of a package or simply the latest
 -- version.
@@ -199,28 +213,6 @@ data PackagesPreferenceDefault =
    | PreferLatestForSelected
   deriving Show
 
--- | Policy for relaxing upper bounds in dependencies. For example, given
--- 'build-depends: array >= 0.3 && < 0.5', are we allowed to relax the upper
--- bound and choose a version of 'array' that is greater or equal to 0.5? By
--- default the upper bounds are always strictly honored.
-data AllowNewer =
-
-  -- | Default: honor the upper bounds in all dependencies, never choose
-  -- versions newer than allowed.
-  AllowNewerNone
-
-  -- | Ignore upper bounds in dependencies on the given packages.
-  | AllowNewerSome [PackageName]
-
-  -- | Ignore upper bounds in dependencies on all packages.
-  | AllowNewerAll
-
--- | Convert 'AllowNewer' to a boolean.
-isAllowNewer :: AllowNewer -> Bool
-isAllowNewer AllowNewerNone     = False
-isAllowNewer (AllowNewerSome _) = True
-isAllowNewer AllowNewerAll      = True
-
 -- | A type to represent the unfolding of an expensive long running
 -- calculation that may fail. We may get intermediate steps before the final
 -- result which may be used to indicate progress and\/or logging messages.
@@ -245,7 +237,7 @@ foldProgress step fail done = fold
         fold (Done r)   = done r
 
 instance Monad (Progress step fail) where
-  return a = Done a
+  return   = pure
   p >>= f  = foldProgress Step Fail f p
 
 instance Applicative (Progress step fail) where
@@ -269,11 +261,14 @@ data ConstraintSource =
   -- | Main config file, which is ~/.cabal/config by default.
   ConstraintSourceMainConfig FilePath
 
+  -- | Local cabal.project file
+  | ConstraintSourceProjectConfig FilePath
+
   -- | Sandbox config file, which is ./cabal.sandbox.config by default.
   | ConstraintSourceSandboxConfig FilePath
 
-  -- | ./cabal.config.
-  | ConstraintSourceUserConfig
+  -- | User config file, which is ./cabal.config by default.
+  | ConstraintSourceUserConfig FilePath
 
   -- | Flag specified on the command line.
   | ConstraintSourceCommandlineFlag
@@ -298,15 +293,19 @@ data ConstraintSource =
 
   -- | The source of the constraint is not specified.
   | ConstraintSourceUnknown
-  deriving (Eq, Show)
+  deriving (Eq, Show, Generic)
+
+instance Binary ConstraintSource
 
 -- | Description of a 'ConstraintSource'.
 showConstraintSource :: ConstraintSource -> String
 showConstraintSource (ConstraintSourceMainConfig path) =
     "main config " ++ path
+showConstraintSource (ConstraintSourceProjectConfig path) =
+    "project config " ++ path
 showConstraintSource (ConstraintSourceSandboxConfig path) =
     "sandbox config " ++ path
-showConstraintSource ConstraintSourceUserConfig = "cabal.config"
+showConstraintSource (ConstraintSourceUserConfig path)= "user config " ++ path
 showConstraintSource ConstraintSourceCommandlineFlag = "command line flag"
 showConstraintSource ConstraintSourceUserTarget = "user target"
 showConstraintSource ConstraintSourceNonUpgradeablePackage =

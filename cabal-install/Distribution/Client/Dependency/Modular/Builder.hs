@@ -24,7 +24,8 @@ import Distribution.Client.Dependency.Modular.Dependency
 import Distribution.Client.Dependency.Modular.Flag
 import Distribution.Client.Dependency.Modular.Index
 import Distribution.Client.Dependency.Modular.Package
-import Distribution.Client.Dependency.Modular.PSQ as P
+import Distribution.Client.Dependency.Modular.PSQ (PSQ)
+import qualified Distribution.Client.Dependency.Modular.PSQ as P
 import Distribution.Client.Dependency.Modular.Tree
 
 import Distribution.Client.ComponentDeps (Component)
@@ -58,8 +59,11 @@ extendOpen qpn' gs s@(BS { rdeps = gs', open = o' }) = go gs' o' gs
       | qpn `M.member` g  = go (M.adjust ((c, qpn'):) qpn g)              o  ngs
       | otherwise         = go (M.insert qpn [(c, qpn')]  g) (cons' ng () o) ngs
           -- code above is correct; insert/adjust have different arg order
+    go g o (   (OpenGoal (Simple (Ext _ext ) _) _gr) : ngs) = go g o ngs
+    go g o (   (OpenGoal (Simple (Lang _lang)_) _gr) : ngs) = go g o ngs
+    go g o (   (OpenGoal (Simple (Pkg _pn _vr)_) _gr) : ngs)= go g o ngs
 
-    cons' = cons . forgetCompOpenGoal
+    cons' = P.cons . forgetCompOpenGoal
 
 -- | Given the current scope, qualify all the package names in the given set of
 -- dependencies and then extend the set of open goals accordingly.
@@ -114,6 +118,12 @@ build = ana go
     --
     -- For a package, we look up the instances available in the global info,
     -- and then handle each instance in turn.
+    go    (BS { index = _  , next = OneGoal (OpenGoal (Simple (Ext _             ) _) _ ) }) =
+      error "Distribution.Client.Dependency.Modular.Builder: build.go called with Ext goal"
+    go    (BS { index = _  , next = OneGoal (OpenGoal (Simple (Lang _            ) _) _ ) }) =
+      error "Distribution.Client.Dependency.Modular.Builder: build.go called with Lang goal"
+    go    (BS { index = _  , next = OneGoal (OpenGoal (Simple (Pkg _ _          ) _) _ ) }) =
+      error "Distribution.Client.Dependency.Modular.Builder: build.go called with Pkg goal"
     go bs@(BS { index = idx, next = OneGoal (OpenGoal (Simple (Dep qpn@(Q _ pn) _) _) gr) }) =
       case M.lookup pn idx of
         Nothing  -> FailF (toConflictSet (Goal (P qpn) gr)) (BuildFailureNotInIndex pn)
@@ -134,6 +144,11 @@ build = ana go
         reorder True  = id
         reorder False = reverse
         trivial = L.null t && L.null f
+
+    -- For a stanza, we also create only two subtrees. The order is initially
+    -- False, True. This can be changed later by constraints (force enabling
+    -- the stanza by replacing the False branch with failure) or preferences
+    -- (try enabling the stanza if possible by moving the True branch first).
 
     go bs@(BS { next = OneGoal (OpenGoal (Stanza qsn@(SN (PI qpn _) _) t) gr) }) =
       SChoiceF qsn gr trivial (P.fromList
@@ -165,4 +180,4 @@ buildTree idx ind igs =
     topLevelGoal qpn = OpenGoal (Simple (Dep qpn (Constrained [])) ()) [UserGoal]
 
     qpns | ind       = makeIndependent igs
-         | otherwise = L.map (Q None) igs
+         | otherwise = L.map (Q (PP DefaultNamespace Unqualified)) igs

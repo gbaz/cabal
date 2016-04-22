@@ -19,25 +19,14 @@ module Distribution.Simple.Build.PathsModule (
   ) where
 
 import Distribution.System
-         ( OS(Windows), buildOS, Arch(..), buildArch )
 import Distribution.Simple.Compiler
-         ( CompilerFlavor(..), compilerFlavor, compilerVersion )
 import Distribution.Package
-         ( packageId, packageName, packageVersion )
 import Distribution.PackageDescription
-         ( PackageDescription(..), hasLibs )
 import Distribution.Simple.LocalBuildInfo
-         ( LocalBuildInfo(..), InstallDirs(..)
-         , absoluteInstallDirs, prefixRelativeInstallDirs )
-import Distribution.Simple.Setup ( CopyDest(NoCopyDest) )
 import Distribution.Simple.BuildPaths
-         ( autogenModuleName )
 import Distribution.Simple.Utils
-         ( shortRelativePath )
 import Distribution.Text
-         ( display )
 import Distribution.Version
-         ( Version(..), orLaterVersion, withinRange )
 
 import System.FilePath
          ( pathSeparator )
@@ -48,11 +37,11 @@ import Data.Maybe
 -- * Building Paths_<pkg>.hs
 -- ------------------------------------------------------------
 
-generate :: PackageDescription -> LocalBuildInfo -> String
-generate pkg_descr lbi =
+generate :: PackageDescription -> LocalBuildInfo -> ComponentLocalBuildInfo -> String
+generate pkg_descr lbi clbi =
    let pragmas = cpp_pragma ++ ffi_pragmas ++ warning_pragmas
 
-       cpp_pragma | supports_cpp = "{-# LANGUAGE CPP #-}"
+       cpp_pragma | supports_cpp = "{-# LANGUAGE CPP #-}\n"
                   | otherwise    = ""
 
        ffi_pragmas
@@ -64,7 +53,8 @@ generate pkg_descr lbi =
           "{-# OPTIONS_JHC -fffi #-}\n"
 
        warning_pragmas =
-        "{-# OPTIONS_GHC -fno-warn-missing-import-lists #-}\n"
+        "{-# OPTIONS_GHC -fno-warn-missing-import-lists #-}\n"++
+        "{-# OPTIONS_GHC -fno-warn-implicit-prelude #-}\n"
 
        foreign_imports
         | absolute = ""
@@ -179,6 +169,8 @@ generate pkg_descr lbi =
    in header++body
 
  where
+        cid = componentUnitId clbi
+
         InstallDirs {
           prefix     = flat_prefix,
           bindir     = flat_bindir,
@@ -186,14 +178,14 @@ generate pkg_descr lbi =
           datadir    = flat_datadir,
           libexecdir = flat_libexecdir,
           sysconfdir = flat_sysconfdir
-        } = absoluteInstallDirs pkg_descr lbi NoCopyDest
+        } = absoluteComponentInstallDirs pkg_descr lbi cid NoCopyDest
         InstallDirs {
           bindir     = flat_bindirrel,
           libdir     = flat_libdirrel,
           datadir    = flat_datadirrel,
           libexecdir = flat_libexecdirrel,
           sysconfdir = flat_sysconfdirrel
-        } = prefixRelativeInstallDirs (packageId pkg_descr) lbi
+        } = prefixRelativeComponentInstallDirs (packageId pkg_descr) lbi cid
 
         flat_bindirreloc = shortRelativePath flat_prefix flat_bindir
         flat_libdirreloc = shortRelativePath flat_prefix flat_libdir
@@ -214,6 +206,11 @@ generate pkg_descr lbi =
           where var' = pkgPathEnvVar pkg_descr var
 
         -- In several cases we cannot make relocatable installations
+        -- WARNING: The CopyOneShot package test hacks
+        -- @absolute == True@ to disable relocatable programs
+        -- by giving the package a library as well.  If you change
+        -- this logic (e.g., we start to support relocatable libraries
+        -- by default) you will need to update this test.
         absolute =
              hasLibs pkg_descr        -- we can only make progs relocatable
           || isNothing flat_bindirrel -- if the bin dir is an absolute path

@@ -2,17 +2,31 @@
 -- | DSL for testing the modular solver
 module UnitTests.Distribution.Client.Dependency.Modular.DSL (
     ExampleDependency(..)
+  , Dependencies(..)
+  , ExTest(..)
+  , ExPreference(..)
   , ExampleDb
+  , ExampleVersionRange
+  , ExamplePkgVersion
+  , ExamplePkgName
+  , ExampleAvailable(..)
+  , ExampleInstalled(..)
+  , IndepGoals(..)
+  , ReorderGoals(..)
   , exAv
   , exInst
+  , exFlag
   , exResolve
   , extractInstallPlan
   , withSetupDeps
+  , withTest
+  , withTests
   ) where
 
 -- base
 import Data.Either (partitionEithers)
 import Data.Maybe (catMaybes)
+import Data.List (nub)
 import Data.Monoid
 import Data.Version
 import qualified Data.Map as Map
@@ -21,11 +35,12 @@ import qualified Data.Map as Map
 import qualified Distribution.Compiler             as C
 import qualified Distribution.InstalledPackageInfo as C
 import qualified Distribution.Package              as C
-  hiding (HasInstalledPackageId(..))
+  hiding (HasUnitId(..))
 import qualified Distribution.PackageDescription   as C
 import qualified Distribution.Simple.PackageIndex  as C.PackageIndex
 import qualified Distribution.System               as C
 import qualified Distribution.Version              as C
+import Language.Haskell.Extension (Extension(..), Language)
 
 -- cabal-install
 import Distribution.Client.ComponentDeps (ComponentDeps)
@@ -34,6 +49,7 @@ import Distribution.Client.Dependency.Types
 import Distribution.Client.Types
 import qualified Distribution.Client.InstallPlan   as CI.InstallPlan
 import qualified Distribution.Client.PackageIndex  as CI.PackageIndex
+import qualified Distribution.Client.PkgConfigDb   as PC
 import qualified Distribution.Client.ComponentDeps as CD
 
 {-------------------------------------------------------------------------------
@@ -59,7 +75,7 @@ import qualified Distribution.Client.ComponentDeps as CD
   * The difference between `GenericPackageDescription` and `PackageDescription`
     is that `PackageDescription` describes a particular _configuration_ of a
     package (for instance, see documentation for `checkPackage`). A
-    `GenericPackageDescription` can be returned into a `PackageDescription` in
+    `GenericPackageDescription` can be turned into a `PackageDescription` in
     two ways:
 
       a. `finalizePackageDescription` does the proper translation, by taking
@@ -83,6 +99,10 @@ type ExamplePkgVersion = Int
 type ExamplePkgHash    = String  -- for example "installed" packages
 type ExampleFlagName   = String
 type ExampleTestName   = String
+type ExampleVersionRange = C.VersionRange
+
+data Dependencies = NotBuildable | Buildable [ExampleDependency]
+  deriving Show
 
 data ExampleDependency =
     -- | Simple dependency on any version
@@ -92,105 +112,188 @@ data ExampleDependency =
   | ExFix ExamplePkgName ExamplePkgVersion
 
     -- | Dependencies indexed by a flag
-  | ExFlag ExampleFlagName [ExampleDependency] [ExampleDependency]
+  | ExFlag ExampleFlagName Dependencies Dependencies
 
-    -- | Dependency if tests are enabled
-  | ExTest ExampleTestName [ExampleDependency]
+    -- | Dependency on a language extension
+  | ExExt Extension
+
+    -- | Dependency on a language version
+  | ExLang Language
+
+    -- | Dependency on a pkg-config package
+  | ExPkg (ExamplePkgName, ExamplePkgVersion)
+  deriving Show
+
+data ExTest = ExTest ExampleTestName [ExampleDependency]
+
+exFlag :: ExampleFlagName -> [ExampleDependency] -> [ExampleDependency]
+       -> ExampleDependency
+exFlag n t e = ExFlag n (Buildable t) (Buildable e)
+
+data ExPreference = ExPref String ExampleVersionRange
 
 data ExampleAvailable = ExAv {
     exAvName    :: ExamplePkgName
   , exAvVersion :: ExamplePkgVersion
   , exAvDeps    :: ComponentDeps [ExampleDependency]
-  }
+  } deriving Show
 
+-- | Constructs an 'ExampleAvailable' package for the 'ExampleDb',
+-- given:
+--
+--      1. The name 'ExamplePkgName' of the available package,
+--      2. The version 'ExamplePkgVersion' available
+--      3. The list of dependency constraints 'ExampleDependency'
+--         that this package has.  'ExampleDependency' provides
+--         a number of pre-canned dependency types to look at.
+--
 exAv :: ExamplePkgName -> ExamplePkgVersion -> [ExampleDependency]
      -> ExampleAvailable
 exAv n v ds = ExAv { exAvName = n, exAvVersion = v
-                   , exAvDeps = CD.fromLibraryDeps ds }
+                   , exAvDeps = CD.fromLibraryDeps n ds }
 
 withSetupDeps :: ExampleAvailable -> [ExampleDependency] -> ExampleAvailable
 withSetupDeps ex setupDeps = ex {
       exAvDeps = exAvDeps ex <> CD.fromSetupDeps setupDeps
     }
 
+withTest :: ExampleAvailable -> ExTest -> ExampleAvailable
+withTest ex test = withTests ex [test]
+
+withTests :: ExampleAvailable -> [ExTest] -> ExampleAvailable
+withTests ex tests =
+  let testCDs = CD.fromList [(CD.ComponentTest name, deps)
+                            | ExTest name deps <- tests]
+  in ex { exAvDeps = exAvDeps ex <> testCDs }
+
+-- | An installed package in 'ExampleDb'; construct me with 'exInst'.
 data ExampleInstalled = ExInst {
     exInstName         :: ExamplePkgName
   , exInstVersion      :: ExamplePkgVersion
   , exInstHash         :: ExamplePkgHash
-  , exInstBuildAgainst :: [ExampleInstalled]
-  }
+  , exInstBuildAgainst :: [ExamplePkgHash]
+  } deriving Show
 
+-- | Constructs an example installed package given:
+--
+--      1. The name of the package 'ExamplePkgName', i.e., 'String'
+--      2. The version of the package 'ExamplePkgVersion', i.e., 'Int'
+--      3. The IPID for the package 'ExamplePkgHash', i.e., 'String'
+--         (just some unique identifier for the package.)
+--      4. The 'ExampleInstalled' packages which this package was
+--         compiled against.)
+--
 exInst :: ExamplePkgName -> ExamplePkgVersion -> ExamplePkgHash
        -> [ExampleInstalled] -> ExampleInstalled
-exInst = ExInst
+exInst pn v hash deps = ExInst pn v hash (map exInstHash deps)
 
+-- | An example package database is a list of installed packages
+-- 'ExampleInstalled' and available packages 'ExampleAvailable'.
+-- Generally, you want to use 'exInst' and 'exAv' to construct
+-- these packages.
 type ExampleDb = [Either ExampleInstalled ExampleAvailable]
 
 type DependencyTree a = C.CondTree C.ConfVar [C.Dependency] a
 
+newtype IndepGoals = IndepGoals Bool
+  deriving Show
+
+newtype ReorderGoals = ReorderGoals Bool
+  deriving Show
+
 exDbPkgs :: ExampleDb -> [ExamplePkgName]
 exDbPkgs = map (either exInstName exAvName)
 
-exAvSrcPkg :: ExampleAvailable -> SourcePackage
+exAvSrcPkg :: ExampleAvailable -> UnresolvedSourcePackage
 exAvSrcPkg ex =
-    let (libraryDeps, testSuites) = splitTopLevel (CD.libraryDeps (exAvDeps ex))
+    let (libraryDeps, exts, mlang, pcpkgs) = splitTopLevel (CD.libraryDeps (exAvDeps ex))
+        testSuites = [(name, deps) | (CD.ComponentTest name, deps) <- CD.toList (exAvDeps ex)]
     in SourcePackage {
            packageInfoId        = exAvPkgId ex
          , packageSource        = LocalTarballPackage "<<path>>"
          , packageDescrOverride = Nothing
-         , packageDescription   = C.GenericPackageDescription{
+         , packageDescription   = C.GenericPackageDescription {
                C.packageDescription = C.emptyPackageDescription {
                    C.package        = exAvPkgId ex
-                 , C.library        = error "not yet configured: library"
+                 , C.libraries      = error "not yet configured: library"
                  , C.executables    = error "not yet configured: executables"
                  , C.testSuites     = error "not yet configured: testSuites"
                  , C.benchmarks     = error "not yet configured: benchmarks"
                  , C.buildDepends   = error "not yet configured: buildDepends"
                  , C.setupBuildInfo = Just C.SetupBuildInfo {
-                       C.setupDepends = mkSetupDeps (CD.setupDeps (exAvDeps ex))
+                       C.setupDepends = mkSetupDeps (CD.setupDeps (exAvDeps ex)),
+                       C.defaultSetupDepends = False
                      }
                  }
-             , C.genPackageFlags = concatMap extractFlags
-                                   (CD.libraryDeps (exAvDeps ex))
-             , C.condLibrary     = Just $ mkCondTree libraryDeps
+             , C.genPackageFlags = nub $ concatMap extractFlags $
+                                   CD.libraryDeps (exAvDeps ex) ++ concatMap snd testSuites
+             , C.condLibraries   = [(exAvName ex, mkCondTree (extsLib exts <> langLib mlang <> pcpkgLib pcpkgs)
+                                                     disableLib
+                                                     (Buildable libraryDeps))]
              , C.condExecutables = []
-             , C.condTestSuites  = map (\(t, deps) -> (t, mkCondTree deps))
-                                   testSuites
+             , C.condTestSuites  =
+                 let mkTree = mkCondTree mempty disableTest . Buildable
+                 in map (\(t, deps) -> (t, mkTree deps)) testSuites
              , C.condBenchmarks  = []
              }
          }
   where
+    -- Split the set of dependencies into the set of dependencies of the library,
+    -- the dependencies of the test suites and extensions.
     splitTopLevel :: [ExampleDependency]
                   -> ( [ExampleDependency]
-                     , [(ExampleTestName, [ExampleDependency])]
+                     , [Extension]
+                     , Maybe Language
+                     , [(ExamplePkgName, ExamplePkgVersion)] -- pkg-config
                      )
-    splitTopLevel []                = ([], [])
-    splitTopLevel (ExTest t a:deps) =
-      let (other, testSuites) = splitTopLevel deps
-      in (other, (t, a):testSuites)
-    splitTopLevel (dep:deps)        =
-      let (other, testSuites) = splitTopLevel deps
-      in (dep:other, testSuites)
+    splitTopLevel [] =
+        ([], [], Nothing, [])
+    splitTopLevel (ExExt ext:deps) =
+      let (other, exts, lang, pcpkgs) = splitTopLevel deps
+      in (other, ext:exts, lang, pcpkgs)
+    splitTopLevel (ExLang lang:deps) =
+        case splitTopLevel deps of
+            (other, exts, Nothing, pcpkgs) -> (other, exts, Just lang, pcpkgs)
+            _ -> error "Only 1 Language dependency is supported"
+    splitTopLevel (ExPkg pkg:deps) =
+      let (other, exts, lang, pcpkgs) = splitTopLevel deps
+      in (other, exts, lang, pkg:pcpkgs)
+    splitTopLevel (dep:deps) =
+      let (other, exts, lang, pcpkgs) = splitTopLevel deps
+      in (dep:other, exts, lang, pcpkgs)
 
+    -- Extract the total set of flags used
     extractFlags :: ExampleDependency -> [C.Flag]
     extractFlags (ExAny _)      = []
     extractFlags (ExFix _ _)    = []
     extractFlags (ExFlag f a b) = C.MkFlag {
                                       C.flagName        = C.FlagName f
                                     , C.flagDescription = ""
-                                    , C.flagDefault     = False
+                                    , C.flagDefault     = True
                                     , C.flagManual      = False
                                     }
-                                : concatMap extractFlags (a ++ b)
-    extractFlags (ExTest _ a)   = concatMap extractFlags a
+                                : concatMap extractFlags (deps a ++ deps b)
+      where
+        deps :: Dependencies -> [ExampleDependency]
+        deps NotBuildable = []
+        deps (Buildable ds) = ds
+    extractFlags (ExExt _)      = []
+    extractFlags (ExLang _)     = []
+    extractFlags (ExPkg _)      = []
 
-    mkCondTree :: Monoid a => [ExampleDependency] -> DependencyTree a
-    mkCondTree deps =
+    mkCondTree :: Monoid a => a -> (a -> a) -> Dependencies -> DependencyTree a
+    mkCondTree x dontBuild NotBuildable =
+      C.CondNode {
+             C.condTreeData        = dontBuild x
+           , C.condTreeConstraints = []
+           , C.condTreeComponents  = []
+           }
+    mkCondTree x dontBuild (Buildable deps) =
       let (directDeps, flaggedDeps) = splitDeps deps
       in C.CondNode {
-             C.condTreeData        = mempty -- irrelevant to the solver
-           , C.condTreeConstraints = map mkDirect  directDeps
-           , C.condTreeComponents  = map mkFlagged flaggedDeps
+             C.condTreeData        = x -- Necessary for language extensions
+           , C.condTreeConstraints = map mkDirect directDeps
+           , C.condTreeComponents  = map (mkFlagged dontBuild) flaggedDeps
            }
 
     mkDirect :: (ExamplePkgName, Maybe ExamplePkgVersion) -> C.Dependency
@@ -200,17 +303,25 @@ exAvSrcPkg ex =
         v = Version [n, 0, 0] []
 
     mkFlagged :: Monoid a
-              => (ExampleFlagName, [ExampleDependency], [ExampleDependency])
+              => (a -> a)
+              -> (ExampleFlagName, Dependencies, Dependencies)
               -> (C.Condition C.ConfVar
                  , DependencyTree a, Maybe (DependencyTree a))
-    mkFlagged (f, a, b) = ( C.Var (C.Flag (C.FlagName f))
-                          , mkCondTree a
-                          , Just (mkCondTree b)
-                          )
+    mkFlagged dontBuild (f, a, b) = ( C.Var (C.Flag (C.FlagName f))
+                                    , mkCondTree mempty dontBuild a
+                                    , Just (mkCondTree mempty dontBuild b)
+                                    )
 
+    -- Split a set of dependencies into direct dependencies and flagged
+    -- dependencies. A direct dependency is a tuple of the name of package and
+    -- maybe its version (no version means any version) meant to be converted
+    -- to a 'C.Dependency' with 'mkDirect' for example. A flagged dependency is
+    -- the set of dependencies guarded by a flag.
+    --
+    -- TODO: Take care of flagged language extensions and language flavours.
     splitDeps :: [ExampleDependency]
               -> ( [(ExamplePkgName, Maybe Int)]
-                 , [(ExampleFlagName, [ExampleDependency], [ExampleDependency])]
+                 , [(ExampleFlagName, Dependencies, Dependencies)]
                  )
     splitDeps [] =
       ([], [])
@@ -223,13 +334,33 @@ exAvSrcPkg ex =
     splitDeps (ExFlag f a b:deps) =
       let (directDeps, flaggedDeps) = splitDeps deps
       in (directDeps, (f, a, b):flaggedDeps)
-    splitDeps (ExTest _ _:_) =
-      error "Unexpected nested test"
+    splitDeps (_:deps) = splitDeps deps
 
     -- Currently we only support simple setup dependencies
     mkSetupDeps :: [ExampleDependency] -> [C.Dependency]
     mkSetupDeps deps =
       let (directDeps, []) = splitDeps deps in map mkDirect directDeps
+
+    -- A 'C.Library' with just the given extensions in its 'BuildInfo'
+    extsLib :: [Extension] -> C.Library
+    extsLib es = mempty { C.libBuildInfo = mempty { C.otherExtensions = es } }
+
+    -- A 'C.Library' with just the given extensions in its 'BuildInfo'
+    langLib :: Maybe Language -> C.Library
+    langLib (Just lang) = mempty { C.libBuildInfo = mempty { C.defaultLanguage = Just lang } }
+    langLib _ = mempty
+
+    disableLib :: C.Library -> C.Library
+    disableLib lib =
+        lib { C.libBuildInfo = (C.libBuildInfo lib) { C.buildable = False }}
+
+    disableTest :: C.TestSuite -> C.TestSuite
+    disableTest test =
+        test { C.testBuildInfo = (C.testBuildInfo test) { C.buildable = False }}
+
+    -- A 'C.Library' with just the given pkgconfig-depends in its 'BuildInfo'
+    pcpkgLib :: [(ExamplePkgName, ExamplePkgVersion)] -> C.Library
+    pcpkgLib ds = mempty { C.libBuildInfo = mempty { C.pkgconfigDepends = [mkDirect (n, (Just v)) | (n,v) <- ds] } }
 
 exAvPkgId :: ExampleAvailable -> C.PackageIdentifier
 exAvPkgId ex = C.PackageIdentifier {
@@ -239,11 +370,9 @@ exAvPkgId ex = C.PackageIdentifier {
 
 exInstInfo :: ExampleInstalled -> C.InstalledPackageInfo
 exInstInfo ex = C.emptyInstalledPackageInfo {
-      C.installedPackageId = C.InstalledPackageId (exInstHash ex)
+      C.installedUnitId    = C.mkUnitId (exInstHash ex)
     , C.sourcePackageId    = exInstPkgId ex
-    , C.packageKey         = exInstKey ex
-    , C.depends            = map (C.InstalledPackageId . exInstHash)
-                                 (exInstBuildAgainst ex)
+    , C.depends            = map C.mkUnitId (exInstBuildAgainst ex)
     }
 
 exInstPkgId :: ExampleInstalled -> C.PackageIdentifier
@@ -252,59 +381,66 @@ exInstPkgId ex = C.PackageIdentifier {
     , pkgVersion = Version [exInstVersion ex, 0, 0] []
     }
 
-exInstLibName :: ExampleInstalled -> C.LibraryName
-exInstLibName ex = C.packageKeyLibraryName (exInstPkgId ex) (exInstKey ex)
-
-exInstKey :: ExampleInstalled -> C.PackageKey
-exInstKey ex =
-    C.mkPackageKey True
-                   (exInstPkgId ex)
-                   (map exInstLibName (exInstBuildAgainst ex))
-
-exAvIdx :: [ExampleAvailable] -> CI.PackageIndex.PackageIndex SourcePackage
+exAvIdx :: [ExampleAvailable] -> CI.PackageIndex.PackageIndex UnresolvedSourcePackage
 exAvIdx = CI.PackageIndex.fromList . map exAvSrcPkg
 
 exInstIdx :: [ExampleInstalled] -> C.PackageIndex.InstalledPackageIndex
 exInstIdx = C.PackageIndex.fromList . map exInstInfo
 
 exResolve :: ExampleDb
+          -- List of extensions supported by the compiler, or Nothing if unknown.
+          -> Maybe [Extension]
+          -- List of languages supported by the compiler, or Nothing if unknown.
+          -> Maybe [Language]
+          -> PC.PkgConfigDb
           -> [ExamplePkgName]
-          -> Bool
-          -> ([String], Either String CI.InstallPlan.InstallPlan)
-exResolve db targets indepGoals = runProgress $
-    resolveDependencies C.buildPlatform
-                        (C.unknownCompilerInfo C.buildCompilerId C.NoAbiTag)
-                        Modular
+          -> Solver
+          -> Maybe Int
+          -> IndepGoals
+          -> ReorderGoals
+          -> [ExPreference]
+          -> ([String], Either String CI.InstallPlan.SolverInstallPlan)
+exResolve db exts langs pkgConfigDb targets solver mbj (IndepGoals indepGoals) (ReorderGoals reorder) prefs
+    = runProgress $ resolveDependencies C.buildPlatform
+                        compiler pkgConfigDb
+                        solver
                         params
   where
+    defaultCompiler = C.unknownCompilerInfo C.buildCompilerId C.NoAbiTag
+    compiler = defaultCompiler { C.compilerInfoExtensions = exts
+                               , C.compilerInfoLanguages  = langs
+                               }
     (inst, avai) = partitionEithers db
     instIdx      = exInstIdx inst
     avaiIdx      = SourcePackageDb {
                        packageIndex       = exAvIdx avai
                      , packagePreferences = Map.empty
                      }
-    enableTests  = map (\p -> PackageConstraintStanzas
+    enableTests  = fmap (\p -> PackageConstraintStanzas
                               (C.PackageName p) [TestStanzas])
                        (exDbPkgs db)
-    targets'     = map (\p -> NamedPackage (C.PackageName p) []) targets
-    params       = addConstraints (map toLpc enableTests)
-                 $ (standardInstallPolicy instIdx avaiIdx targets') {
-                       depResolverIndependentGoals = indepGoals
-                     }
+    targets'     = fmap (\p -> NamedPackage (C.PackageName p) []) targets
+    params       =   addPreferences (fmap toPref prefs)
+                   $ addConstraints (fmap toLpc enableTests)
+                   $ setIndependentGoals indepGoals
+                   $ setReorderGoals reorder
+                   $ setMaxBackjumps mbj
+                   $ standardInstallPolicy instIdx avaiIdx targets'
     toLpc     pc = LabeledPackageConstraint pc ConstraintSourceUnknown
+    toPref (ExPref n v) = PackageVersionPreference (C.PackageName n) v
 
-extractInstallPlan :: CI.InstallPlan.InstallPlan
+extractInstallPlan :: CI.InstallPlan.SolverInstallPlan
                    -> [(ExamplePkgName, ExamplePkgVersion)]
 extractInstallPlan = catMaybes . map confPkg . CI.InstallPlan.toList
   where
-    confPkg :: CI.InstallPlan.PlanPackage -> Maybe (String, Int)
+    confPkg :: CI.InstallPlan.SolverPlanPackage -> Maybe (String, Int)
     confPkg (CI.InstallPlan.Configured pkg) = Just $ srcPkg pkg
     confPkg _                               = Nothing
 
-    srcPkg :: ConfiguredPackage -> (String, Int)
-    srcPkg (ConfiguredPackage pkg _flags _stanzas _deps) =
+    srcPkg :: SolverPackage UnresolvedPkgLoc -> (String, Int)
+    srcPkg cpkg =
       let C.PackageIdentifier (C.PackageName p) (Version (n:_) _) =
-            packageInfoId pkg
+            packageInfoId (solverPkgSource cpkg)
       in (p, n)
 
 {-------------------------------------------------------------------------------

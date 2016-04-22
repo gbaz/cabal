@@ -56,64 +56,48 @@ module Distribution.Simple (
 -- local
 import Distribution.Simple.Compiler hiding (Flag)
 import Distribution.Simple.UserHooks
-import Distribution.Package --must not specify imports, since we're exporting module.
-import Distribution.PackageDescription
-         ( PackageDescription(..), GenericPackageDescription, Executable(..)
-         , updatePackageDescription, hasLibs
-         , HookedBuildInfo, emptyHookedBuildInfo )
+import Distribution.Package
+import Distribution.PackageDescription hiding (Flag)
 import Distribution.PackageDescription.Parse
-         ( readPackageDescription, readHookedBuildInfo )
 import Distribution.PackageDescription.Configuration
-         ( flattenPackageDescription )
 import Distribution.Simple.Program
-         ( defaultProgramConfiguration, addKnownPrograms, builtinPrograms
-         , restoreProgramConfiguration, reconfigurePrograms )
-import Distribution.Simple.PreProcess (knownSuffixHandlers, PPSuffixHandler)
+import Distribution.Simple.Program.Db
+import Distribution.Simple.PreProcess
 import Distribution.Simple.Setup
 import Distribution.Simple.Command
 
-import Distribution.Simple.Build        ( build, repl )
-import Distribution.Simple.SrcDist      ( sdist )
+import Distribution.Simple.Build
+import Distribution.Simple.SrcDist
 import Distribution.Simple.Register
-         ( register, unregister )
 
 import Distribution.Simple.Configure
-         ( getPersistBuildConfig, maybeGetPersistBuildConfig
-         , writePersistBuildConfig, checkPersistBuildConfigOutdated
-         , configure, checkForeignDeps, findDistPrefOrDefault )
 
-import Distribution.Simple.LocalBuildInfo ( LocalBuildInfo(..) )
-import Distribution.Simple.Bench (bench)
-import Distribution.Simple.BuildPaths ( srcPref)
-import Distribution.Simple.Test (test)
-import Distribution.Simple.Install (install)
-import Distribution.Simple.Haddock (haddock, hscolour)
+import Distribution.Simple.LocalBuildInfo
+import Distribution.Simple.Bench
+import Distribution.Simple.BuildPaths
+import Distribution.Simple.Test
+import Distribution.Simple.Install
+import Distribution.Simple.Haddock
 import Distribution.Simple.Utils
-         (die, notice, info, warn, setupMessage, chattyTry,
-          defaultPackageDesc, defaultHookedPackageDesc,
-          rawSystemExitWithEnv, cabalVersion, topHandler )
-import Distribution.System
-         ( OS(..), buildOS )
+import Distribution.Utils.NubList
 import Distribution.Verbosity
 import Language.Haskell.Extension
 import Distribution.Version
 import Distribution.License
 import Distribution.Text
-         ( display )
 
 -- Base
-import System.Environment(getArgs, getProgName)
-import System.Directory(removeFile, doesFileExist,
-                        doesDirectoryExist, removeDirectoryRecursive)
-import System.Exit       (exitWith,ExitCode(..))
-import System.IO.Error   (isDoesNotExistError)
-import Control.Exception (throwIO)
-import Distribution.Compat.Environment (getEnvironment)
-import Distribution.Compat.Exception (catchIO)
+import System.Environment (getArgs, getProgName)
+import System.Directory   (removeFile, doesFileExist
+                          ,doesDirectoryExist, removeDirectoryRecursive)
+import System.Exit                          (exitWith,ExitCode(..))
+import System.FilePath                      (searchPathSeparator)
+import Distribution.Compat.Environment      (getEnvironment)
+import Distribution.Compat.GetShortPathName (getShortPathName)
 
 import Control.Monad   (when)
 import Data.Foldable   (traverse_)
-import Data.List       (intercalate, unionBy, nub, (\\))
+import Data.List       (unionBy)
 
 -- | A simple implementation of @main@ for a Cabal setup script.
 -- It reads the package description file using IO, and performs the
@@ -322,7 +306,7 @@ copyAction hooks flags args = do
         flags' = flags { copyDistPref = toFlag distPref }
     hookedAction preCopy copyHook postCopy
                  (getBuildConfig hooks verbosity distPref)
-                 hooks flags' args
+                 hooks flags' { copyArgs = args } args
 
 installAction :: UserHooks -> InstallFlags -> Args -> IO ()
 installAction hooks flags args = do
@@ -383,7 +367,7 @@ registerAction hooks flags args = do
         flags' = flags { regDistPref = toFlag distPref }
     hookedAction preReg regHook postReg
                  (getBuildConfig hooks verbosity distPref)
-                 hooks flags' args
+                 hooks flags' { regArgs = args } args
 
 unregisterAction :: UserHooks -> RegisterFlags -> Args -> IO ()
 unregisterAction hooks flags args = do
@@ -424,19 +408,15 @@ hookedActionWithArgs pre_hook cmd_hook post_hook get_build_config hooks flags ar
    post_hook hooks args flags pkg_descr localbuildinfo
 
 sanityCheckHookedBuildInfo :: PackageDescription -> HookedBuildInfo -> IO ()
-sanityCheckHookedBuildInfo PackageDescription { library = Nothing } (Just _,_)
-    = die $ "The buildinfo contains info for a library, "
-         ++ "but the package does not have a library."
-
-sanityCheckHookedBuildInfo pkg_descr (_, hookExes)
-    | not (null nonExistant)
-    = die $ "The buildinfo contains info for an executable called '"
-         ++ head nonExistant ++ "' but the package does not have a "
-         ++ "executable with that name."
+sanityCheckHookedBuildInfo pkg_descr hooked_bis
+    | not (null nonExistentComponents)
+    = die $ "The buildinfo contains info for these non-existent components:"
+         ++ intercalate ", " (map showComponentName nonExistentComponents)
   where
-    pkgExeNames  = nub (map exeName (executables pkg_descr))
-    hookExeNames = nub (map fst hookExes)
-    nonExistant  = hookExeNames \\ pkgExeNames
+    nonExistentComponents =
+        [ cname
+        | (cname, _) <- hooked_bis
+        , Nothing <- [lookupComponent pkg_descr cname] ]
 
 sanityCheckHookedBuildInfo _ _ = return ()
 
@@ -470,9 +450,9 @@ getBuildConfig hooks verbosity distPref = do
             -- Since the list of unconfigured programs is not serialized,
             -- restore it to the same value as normally used at the beginning
             -- of a configure run:
-            configPrograms = restoreProgramConfiguration
+            configPrograms_ = restoreProgramConfiguration
                                (builtinPrograms ++ hookedPrograms hooks)
-                               (configPrograms cFlags),
+                               `fmap` configPrograms_ cFlags,
 
             -- Use the current, not saved verbosity level:
             configVerbosity = Flag verbosity
@@ -587,12 +567,9 @@ autoconfUserHooks
     = simpleUserHooks
       {
        postConf    = defaultPostConf,
-       preBuild    = \_ flags ->
-                       -- not using 'readHook' here because 'build' takes
-                       -- extra args
-                       getHookedBuildInfo $ fromFlag $ buildVerbosity flags,
+       preBuild    = readHookWithArgs buildVerbosity,
+       preCopy     = readHookWithArgs copyVerbosity,
        preClean    = readHook cleanVerbosity,
-       preCopy     = readHook copyVerbosity,
        preInst     = readHook installVerbosity,
        preHscolour = readHook hscolourVerbosity,
        preHaddock  = readHook haddockVerbosity,
@@ -616,6 +593,12 @@ autoconfUserHooks
 
           backwardsCompatHack = False
 
+          readHookWithArgs :: (a -> Flag Verbosity) -> Args -> a -> IO HookedBuildInfo
+          readHookWithArgs get_verbosity _ flags = do
+              getHookedBuildInfo verbosity
+            where
+              verbosity = fromFlag (get_verbosity flags)
+
           readHook :: (a -> Flag Verbosity) -> Args -> a -> IO HookedBuildInfo
           readHook get_verbosity a flags = do
               noExtraFlags a
@@ -626,42 +609,35 @@ autoconfUserHooks
 runConfigureScript :: Verbosity -> Bool -> ConfigFlags -> LocalBuildInfo
                    -> IO ()
 runConfigureScript verbosity backwardsCompatHack flags lbi = do
-
   env <- getEnvironment
   let programConfig = withPrograms lbi
   (ccProg, ccFlags) <- configureCCompiler verbosity programConfig
+  ccProgShort <- getShortPathName ccProg
   -- The C compiler's compilation and linker flags (e.g.
   -- "C compiler flags" and "Gcc Linker flags" from GHC) have already
   -- been merged into ccFlags, so we set both CFLAGS and LDFLAGS
   -- to ccFlags
   -- We don't try and tell configure which ld to use, as we don't have
   -- a way to pass its flags too
-  let env' = appendToEnvironment ("CFLAGS",  unwords ccFlags)
-             env
-      args' = args ++ ["--with-gcc=" ++ ccProg]
-  handleNoWindowsSH $
-    rawSystemExitWithEnv verbosity "sh" args' env'
+  let extraPath = fromNubList $ configProgramPathExtra flags
+  let cflagsEnv = maybe (unwords ccFlags) (++ (" " ++ unwords ccFlags)) $ lookup "CFLAGS" env
+      spSep = [searchPathSeparator]
+      pathEnv = maybe (intercalate spSep extraPath) ((intercalate spSep extraPath ++ spSep)++) $ lookup "PATH" env
+      overEnv = ("CFLAGS", Just cflagsEnv) : [("PATH", Just pathEnv) | not (null extraPath)]
+      args' = args ++ ["CC=" ++ ccProgShort]
+      shProg = simpleProgram "sh"
+      progDb = modifyProgramSearchPath (\p -> map ProgramSearchPathDir extraPath ++ p) emptyProgramDb
+  shConfiguredProg <- lookupProgram shProg `fmap` configureProgram  verbosity shProg progDb
+  case shConfiguredProg of
+      Just sh -> runProgramInvocation verbosity (programInvocation (sh {programOverrideEnv = overEnv}) args')
+      Nothing -> die notFoundMsg
 
   where
     args = "./configure" : configureArgs backwardsCompatHack flags
 
-    appendToEnvironment (key, val) [] = [(key, val)]
-    appendToEnvironment (key, val) (kv@(k, v) : rest)
-     | key == k  = (key, v ++ " " ++ val) : rest
-     | otherwise = kv : appendToEnvironment (key, val) rest
-
-    handleNoWindowsSH action
-      | buildOS /= Windows
-      = action
-
-      | otherwise
-      = action
-          `catchIO` \ioe -> if isDoesNotExistError ioe
-                              then die notFoundMsg
-                              else throwIO ioe
-
-    notFoundMsg = "The package has a './configure' script. This requires a "
-               ++ "Unix compatibility toolchain such as MinGW+MSYS or Cygwin."
+    notFoundMsg = "The package has a './configure' script. If you are on Windows, This requires a "
+               ++ "Unix compatibility toolchain such as MinGW+MSYS or Cygwin. "
+               ++ "If you are not on Windows, ensure that an 'sh' command is discoverable in your path."
 
 getHookedBuildInfo :: Verbosity -> IO HookedBuildInfo
 getHookedBuildInfo verbosity = do
@@ -714,6 +690,5 @@ defaultRegHook :: PackageDescription -> LocalBuildInfo
 defaultRegHook pkg_descr localbuildinfo _ flags =
     if hasLibs pkg_descr
     then register pkg_descr localbuildinfo flags
-    else setupMessage verbosity
+    else setupMessage (fromFlag (regVerbosity flags))
            "Package contains no library to register:" (packageId pkg_descr)
-  where verbosity = fromFlag (regVerbosity flags)

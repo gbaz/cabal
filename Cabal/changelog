@@ -1,16 +1,52 @@
 -*-change-log-*-
 
-1.23.x.x (current development version)
+1.25.x.x (current development version)
+	* Dropped support for versions of GHC earlier than 6.12 (#3111).
+	* Convenience/internal libraries are now supported (#269).
+	  An internal library is declared using the stanza "library
+	  'libname'".  Packages which use internal libraries can
+	  result in multiple registrations; thus '--gen-pkg-config'
+	  can now output a directory of registration scripts rather than
+	  a single file.
+	* Backwards incompatible change to preprocessor interface:
+	  the function in 'PPSuffixHandler' now takes an additional
+	  'ComponentLocalBuildInfo' specifying the build information
+	  of the component being preprocessed.
+	* Backwards incompatible change to 'cabal_macros.h' (#1893): we now
+	  generate a macro file for each component which contains only
+	  information about the direct dependencies of that component.
+	  Consequently, 'dist/build/autogen/cabal_macros.h' contains
+	  only the macros for the library, and is not generated if a
+	  package has no library; to find the macros for an executable
+	  named 'foobar', look in 'dist/build/foobar/autogen/cabal_macros.h'.
+
+1.24.0.0 Ryan Thomas <ryan@ryant.org> March 2016
+	* Support GHC 8.
 	* Deal with extra C sources from preprocessors (#238).
 	* Include cabal_macros.h when running c2hs (#2600).
 	* Don't recompile C sources unless needed (#2601).
 	* Read 'builddir' option from 'CABAL_BUILDDIR' environment variable
-	* Add '--profiling-defail=$level' flag with a default for libraries
+	* Add '--profiling-detail=$level' flag with a default for libraries
 	  and executables of 'exported-functions' and 'toplevel-functions'
 	  respetively (GHC's '-fprof-auto-{exported,top}' flags) (#193).
 	* New 'custom-setup' stanza to specify setup deps. Setup is also built
 	  with the cabal_macros.h style macros, for conditional compilation.
 	* Support Haddock response files (#2746).
+	* Fixed a bug in the Text instance for Platform (#2862).
+	* New 'setup haddock' option: '--for-hackage' (#2852).
+	* New --show-detail=direct; like streaming, but allows the test
+	  program to detect that is connected to a terminal, and works
+	  reliable with a non-threaded runtime (#2911, and serves as a
+	  work-around for #2398)
+	* Library support for multi-instance package DBs (#2948).
+	* Improved the './Setup configure' solver (#3082, #3076).
+	* The '--allow-newer' option can be now used with './Setup
+	configure' (#3163).
+	* Added a way to specify extra locations to find OS X frameworks
+	in ('extra-framework-dirs'). Can be used both in .cabal files and
+	as an argument to './Setup configure' (#3158).
+	* Macros 'VERSION_$pkgname' and 'MIN_VERSION_$pkgname' are now
+	also generated for the current package. (#3235).
 
 1.22.0.0 Johan Tibell <johan.tibell@gmail.com> January 2015
 	* Support GHC 7.10.
@@ -43,7 +79,7 @@
 	* Make 'cabal test'/'cabal bench' build only what's needed for
 	running tests/benchmarks (#1821).
 	* Build shared libraries by default when linking executables dynamically.
-	* Build profiled libraries by default when profiling executable.s
+	* Build profiled libraries by default when profiling executables.
 
 1.20.0.1 Johan Tibell <johan.tibell@gmail.com> May 2014
 	* Fix streaming test output.

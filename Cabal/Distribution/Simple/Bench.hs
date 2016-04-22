@@ -16,22 +16,17 @@ module Distribution.Simple.Bench
     ) where
 
 import qualified Distribution.PackageDescription as PD
-    ( PackageDescription(..), BuildInfo(buildable)
-    , Benchmark(..), BenchmarkInterface(..), benchmarkType, hasBenchmarks )
-import Distribution.Simple.BuildPaths ( exeExtension )
-import Distribution.Simple.Compiler ( compilerInfo )
+import Distribution.Simple.BuildPaths
+import Distribution.Simple.Compiler
 import Distribution.Simple.InstallDirs
-    ( fromPathTemplate, initialPathTemplateEnv, PathTemplateVariable(..)
-    , substPathTemplate , toPathTemplate, PathTemplate )
 import qualified Distribution.Simple.LocalBuildInfo as LBI
-    ( LocalBuildInfo(..), localLibraryName )
-import Distribution.Simple.Setup ( BenchmarkFlags(..), fromFlag )
-import Distribution.Simple.UserHooks ( Args )
-import Distribution.Simple.Utils ( die, notice, rawSystemExitCode )
+import Distribution.Simple.Setup
+import Distribution.Simple.UserHooks
+import Distribution.Simple.Utils
 import Distribution.Text
 
-import Control.Monad ( when, unless )
-import System.Exit ( ExitCode(..), exitFailure, exitWith )
+import Control.Monad ( when, unless, forM )
+import System.Exit ( ExitCode(..), exitFailure, exitSuccess )
 import System.Directory ( doesFileExist )
 import System.FilePath ( (</>), (<.>) )
 
@@ -78,9 +73,9 @@ bench args pkg_descr lbi flags = do
                       ++ show (disp $ PD.benchmarkType bm)
                   exitFailure
 
-    when (not $ PD.hasBenchmarks pkg_descr) $ do
+    unless (PD.hasBenchmarks pkg_descr) $ do
         notice verbosity "Package has no benchmarks."
-        exitWith ExitSuccess
+        exitSuccess
 
     when (PD.hasBenchmarks pkg_descr && null enabledBenchmarks) $
         die $ "No benchmarks enabled. Did you remember to configure with "
@@ -88,7 +83,7 @@ bench args pkg_descr lbi flags = do
 
     bmsToRun <- case benchmarkNames of
             [] -> return enabledBenchmarks
-            names -> flip mapM names $ \bmName ->
+            names -> forM names $ \bmName ->
                 let benchmarkMap = zip enabledNames enabledBenchmarks
                     enabledNames = map PD.benchmarkName enabledBenchmarks
                     allNames = map PD.benchmarkName pkgBenchmarks
@@ -123,6 +118,6 @@ benchOption pkg_descr lbi bm template =
     fromPathTemplate $ substPathTemplate env template
   where
     env = initialPathTemplateEnv
-          (PD.package pkg_descr) (LBI.localLibraryName lbi)
+          (PD.package pkg_descr) (LBI.localUnitId lbi)
           (compilerInfo $ LBI.compiler lbi) (LBI.hostPlatform lbi) ++
           [(BenchmarkNameVar, toPathTemplate $ PD.benchmarkName bm)]

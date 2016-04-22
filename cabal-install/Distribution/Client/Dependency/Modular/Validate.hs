@@ -10,18 +10,25 @@ import Control.Applicative
 import Control.Monad.Reader hiding (sequence)
 import Data.List as L
 import Data.Map as M
+import Data.Set as S
 import Data.Traversable
 import Prelude hiding (sequence)
+
+import Language.Haskell.Extension (Extension, Language)
+
+import Distribution.Compiler (CompilerInfo(..))
 
 import Distribution.Client.Dependency.Modular.Assignment
 import Distribution.Client.Dependency.Modular.Dependency
 import Distribution.Client.Dependency.Modular.Flag
 import Distribution.Client.Dependency.Modular.Index
 import Distribution.Client.Dependency.Modular.Package
-import Distribution.Client.Dependency.Modular.PSQ as P
+import qualified Distribution.Client.Dependency.Modular.PSQ as P
 import Distribution.Client.Dependency.Modular.Tree
+import Distribution.Client.Dependency.Modular.Version (VR)
 
 import Distribution.Client.ComponentDeps (Component)
+import Distribution.Client.PkgConfigDb (PkgConfigDb, pkgConfigPkgIsPresent)
 
 -- In practice, most constraints are implication constraints (IF we have made
 -- a number of choices, THEN we also have to ensure that). We call constraints
@@ -75,6 +82,9 @@ import Distribution.Client.ComponentDeps (Component)
 
 -- | The state needed during validation.
 data ValidateState = VS {
+  supportedExt  :: Extension -> Bool,
+  supportedLang :: Language  -> Bool,
+  presentPkgs   :: PN -> VR  -> Bool,
   index :: Index,
   saved :: Map QPN (FlaggedDeps Component QPN), -- saved, scoped, dependencies
   pa    :: PreAssignment,
@@ -123,6 +133,9 @@ validate = cata go
     goP :: QPN -> QGoalReasonChain -> POption -> Validate (Tree QGoalReasonChain) -> Validate (Tree QGoalReasonChain)
     goP qpn@(Q _pp pn) gr (POption i _) r = do
       PA ppa pfa psa <- asks pa    -- obtain current preassignment
+      extSupported   <- asks supportedExt  -- obtain the supported extensions
+      langSupported  <- asks supportedLang -- obtain the supported languages
+      pkgPresent     <- asks presentPkgs -- obtain the present pkg-config pkgs
       idx            <- asks index -- obtain the index
       svd            <- asks saved -- obtain saved dependencies
       qo             <- asks qualifyOptions
@@ -135,7 +148,7 @@ validate = cata go
       let goal = Goal (P qpn) gr
       let newactives = Dep qpn (Fixed i goal) : L.map (resetGoal goal) (extractDeps pfa psa qdeps)
       -- We now try to extend the partial assignment with the new active constraints.
-      let mnppa = extend (P qpn) ppa newactives
+      let mnppa = extend extSupported langSupported pkgPresent goal ppa newactives
       -- In case we continue, we save the scoped dependencies
       let nsvd = M.insert qpn qdeps svd
       case mfr of
@@ -151,6 +164,9 @@ validate = cata go
     goF :: QFN -> QGoalReasonChain -> Bool -> Validate (Tree QGoalReasonChain) -> Validate (Tree QGoalReasonChain)
     goF qfn@(FN (PI qpn _i) _f) gr b r = do
       PA ppa pfa psa <- asks pa -- obtain current preassignment
+      extSupported   <- asks supportedExt  -- obtain the supported extensions
+      langSupported  <- asks supportedLang -- obtain the supported languages
+      pkgPresent     <- asks presentPkgs   -- obtain the present pkg-config pkgs
       svd <- asks saved         -- obtain saved dependencies
       -- Note that there should be saved dependencies for the package in question,
       -- because while building, we do not choose flags before we see the packages
@@ -165,7 +181,7 @@ validate = cata go
       -- we have chosen a new flag.
       let newactives = extractNewDeps (F qfn) gr b npfa psa qdeps
       -- As in the package case, we try to extend the partial assignment.
-      case extend (F qfn) ppa newactives of
+      case extend extSupported langSupported pkgPresent (Goal (F qfn) gr) ppa newactives of
         Left (c, d) -> return (Fail c (Conflicting d)) -- inconsistency found
         Right nppa  -> local (\ s -> s { pa = PA nppa npfa psa }) r
 
@@ -173,6 +189,9 @@ validate = cata go
     goS :: QSN -> QGoalReasonChain -> Bool -> Validate (Tree QGoalReasonChain) -> Validate (Tree QGoalReasonChain)
     goS qsn@(SN (PI qpn _i) _f) gr b r = do
       PA ppa pfa psa <- asks pa -- obtain current preassignment
+      extSupported   <- asks supportedExt  -- obtain the supported extensions
+      langSupported  <- asks supportedLang -- obtain the supported languages
+      pkgPresent     <- asks presentPkgs -- obtain the present pkg-config pkgs
       svd <- asks saved         -- obtain saved dependencies
       -- Note that there should be saved dependencies for the package in question,
       -- because while building, we do not choose flags before we see the packages
@@ -187,7 +206,7 @@ validate = cata go
       -- we have chosen a new flag.
       let newactives = extractNewDeps (S qsn) gr b pfa npsa qdeps
       -- As in the package case, we try to extend the partial assignment.
-      case extend (S qsn) ppa newactives of
+      case extend extSupported langSupported pkgPresent (Goal (S qsn) gr) ppa newactives of
         Left (c, d) -> return (Fail c (Conflicting d)) -- inconsistency found
         Right nppa  -> local (\ s -> s { pa = PA nppa pfa npsa }) r
 
@@ -235,10 +254,17 @@ extractNewDeps v gr b fa sa = go
                                   Just False -> []
 
 -- | Interface.
-validateTree :: Index -> Tree QGoalReasonChain -> Tree QGoalReasonChain
-validateTree idx t = runReader (validate t) VS {
-    index = idx
-  , saved = M.empty
-  , pa    = PA M.empty M.empty M.empty
+validateTree :: CompilerInfo -> Index -> PkgConfigDb -> Tree QGoalReasonChain -> Tree QGoalReasonChain
+validateTree cinfo idx pkgConfigDb t = runReader (validate t) VS {
+    supportedExt   = maybe (const True) -- if compiler has no list of extensions, we assume everything is supported
+                           (\ es -> let s = S.fromList es in \ x -> S.member x s)
+                           (compilerInfoExtensions cinfo)
+  , supportedLang  = maybe (const True)
+                           (flip L.elem) -- use list lookup because language list is small and no Ord instance
+                           (compilerInfoLanguages  cinfo)
+  , presentPkgs    = pkgConfigPkgIsPresent pkgConfigDb
+  , index          = idx
+  , saved          = M.empty
+  , pa             = PA M.empty M.empty M.empty
   , qualifyOptions = defaultQualifyOptions idx
   }

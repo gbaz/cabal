@@ -1,4 +1,3 @@
-{-# LANGUAGE CPP #-}
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.Simple.CCompiler
@@ -47,10 +46,8 @@ module Distribution.Simple.CCompiler (
    filenameCDialect
   ) where
 
-#if __GLASGOW_HASKELL__ < 710
-import Data.Monoid
-     ( Monoid(..) )
-#endif
+import Distribution.Compat.Semigroup as Semi
+
 import System.FilePath
      ( takeExtension )
 
@@ -66,15 +63,16 @@ data CDialect = C
 
 instance Monoid CDialect where
   mempty = C
+  mappend = (Semi.<>)
 
-  mappend C                  anything           = anything
-  mappend ObjectiveC         CPlusPlus          = ObjectiveCPlusPlus
-  mappend CPlusPlus          ObjectiveC         = ObjectiveCPlusPlus
-  mappend _                  ObjectiveCPlusPlus = ObjectiveCPlusPlus
-  mappend ObjectiveC         _                  = ObjectiveC
-  mappend CPlusPlus          _                  = CPlusPlus
-  mappend ObjectiveCPlusPlus _                  = ObjectiveCPlusPlus
-
+instance Semigroup CDialect where
+  C                  <> anything           = anything
+  ObjectiveC         <> CPlusPlus          = ObjectiveCPlusPlus
+  CPlusPlus          <> ObjectiveC         = ObjectiveCPlusPlus
+  _                  <> ObjectiveCPlusPlus = ObjectiveCPlusPlus
+  ObjectiveC         <> _                  = ObjectiveC
+  CPlusPlus          <> _                  = CPlusPlus
+  ObjectiveCPlusPlus <> _                  = ObjectiveCPlusPlus
 
 -- | A list of all file extensions which are recognized as possibly containing
 --   some dialect of C code.  Note that this list is only for source files,
